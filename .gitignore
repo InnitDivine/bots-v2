@@ -6,6 +6,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+bots.local.json
 
 run/
 logs/

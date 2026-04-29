@@ -25,9 +25,10 @@ Required runtime values:
 - `OPENAI_API_KEY`
 - `TWITCH_CLIENT_ID`
 - `TWITCH_CLIENT_SECRET`
-- `TWITCH_BOT_TOKEN_SIENNA`, `TWITCH_BOT_TOKEN_KNIGHT`, `TWITCH_BOT_TOKEN_SIMP`
+- one `TWITCH_BOT_TOKEN_<BOTNAME>` value per bot
 
 TwitchIO tokens must use `oauth:` prefix.
+Real bot accounts and AI-generated personas are stored in ignored `bots.local.json`. The tracked `bots.example.json` is only a generic sample.
 
 ## Guided Quickstart
 
@@ -57,20 +58,20 @@ To add several bots and let AI generate a short role/persona for each one:
 python add_bot_assistant.py --count 3
 ```
 
-The assistant opens a Twitch login for each bot account, writes tokens to `.env`, adds each bot to `config.py`, and adds each AI-generated role to `bot_persona.py`.
+The assistant opens a Twitch login for each bot account, writes tokens to `.env`, and writes each bot plus its AI-generated role to ignored `bots.local.json`.
 
 ## Smoke Test
 
 Safe default:
 
 ```powershell
-python runner.py --bot sienna --smoketest --no-mic --no-helix
+python runner.py --bot <botname> --smoketest --no-mic --no-helix
 ```
 
 Send one live test chat message only when intended:
 
 ```powershell
-python runner.py --bot sienna --smoketest --no-mic --no-helix --send-smoketest-message
+python runner.py --bot <botname> --smoketest --no-mic --no-helix --send-smoketest-message
 ```
 
 ## Normal Run

@@ -13,12 +13,14 @@ from twitchio.ext import commands
 
 from config import (
     BASE_MIN_COOLDOWN_SECS,
+    BROADCASTER_ALIASES,
     FALLBACK_QUESTIONS,
     GLOBAL_MAX_MSG_PER_MINUTE,
     GLOBAL_MIN_COOLDOWN_SECS,
     LLM_MAX_TOKENS,
     MAX_MSG_PER_MINUTE,
     OPENAI_MODEL,
+    PREFERRED_BROADCASTER_NAME,
     REALISTIC_MESSAGES,
     BOTS,
     TARGET_CHANNEL,
@@ -38,26 +40,41 @@ RECENT_CHAT_CONTEXT = 12
 RECENT_HINT_WINDOW = 6
 RECENT_MIC_LINES = 8
 
-STREAMER_ALIASES = ["Divine", "Innit", "innitdivine"]
-PREFERRED_NAME = "Divine"
+STREAMER_ALIASES = BROADCASTER_ALIASES or [TARGET_CHANNEL or "broadcaster"]
+PREFERRED_NAME = PREFERRED_BROADCASTER_NAME or STREAMER_ALIASES[0]
 
-PERSONA_STYLE = {
-    "sienna": {
-        "tone": "supportive, chill, conversational",
-        "phrasing": "soft hype, asks friendly follow-ups",
-        "llm_temp": 0.75,
-    },
-    "knight": {
-        "tone": "confident, analytical, slightly competitive",
-        "phrasing": "short takes about decisions and execution",
-        "llm_temp": 0.8,
-    },
-    "simp": {
-        "tone": "hype-heavy, meme-first, playful",
-        "phrasing": "fast reactions and clip-callouts",
-        "llm_temp": 0.9,
-    },
+DEFAULT_PERSONA_STYLE = {
+    "description": "natural Twitch chatter",
+    "tone": "friendly, natural, chat-safe",
+    "phrasing": "short Twitch chat lines",
+    "llm_temp": 0.75,
 }
+
+
+def _style_from_bot(bot: dict) -> dict:
+    persona = bot.get("persona") if isinstance(bot.get("persona"), dict) else {}
+    style = dict(DEFAULT_PERSONA_STYLE)
+    for key in ("description", "tone", "phrasing"):
+        value = str(persona.get(key) or "").strip()
+        if value:
+            style[key] = value
+    try:
+        style["llm_temp"] = max(0.6, min(1.0, float(persona.get("llm_temp", style["llm_temp"]))))
+    except (TypeError, ValueError):
+        pass
+    return style
+
+
+PERSONA_STYLE = {bot["name"]: _style_from_bot(bot) for bot in BOTS}
+
+
+def _persona_style(name: str) -> dict:
+    return PERSONA_STYLE.get(name, DEFAULT_PERSONA_STYLE)
+
+
+def _alias_text() -> str:
+    aliases = list(dict.fromkeys([PREFERRED_NAME, *STREAMER_ALIASES, TARGET_CHANNEL]))
+    return "/".join(alias for alias in aliases if alias)
 
 
 def _sha12(text: str) -> str:
@@ -202,7 +219,9 @@ class Bot(commands.Bot):
         return time.time() < self._lurk_until
 
     def _maybe_enter_lurk(self):
-        p = 0.14 if self.p.name == "sienna" else (0.10 if self.p.name == "simp" else 0.07)
+        style = _persona_style(self.p.name)
+        temp = float(style.get("llm_temp", DEFAULT_PERSONA_STYLE["llm_temp"]))
+        p = 0.06 if self.p.is_moderator else 0.08 + max(0.0, temp - 0.75) * 0.12
         if self.rng.random() < p:
             dur = self.rng.randint(LURK_MIN_SEC, LURK_MAX_SEC)
             self._lurk_until = time.time() + dur
@@ -239,11 +258,12 @@ class Bot(commands.Bot):
         return self.rng.choice(FALLBACK_QUESTIONS)
 
     def _direct_callout(self) -> str:
+        name = PREFERRED_NAME or TARGET_CHANNEL or "chat"
         base = [
-            f"{self.p.username} here Divine",
-            f"im here Innit",
+            f"{self.p.username} here {name}",
+            f"im here {name}",
             f"{self.p.username} in chat",
-            "here with you Divine",
+            f"here with you {name}",
         ]
         msg = self.rng.choice(base)
         if self.rng.random() < 0.35:
@@ -310,19 +330,16 @@ class Bot(commands.Bot):
         bank = self.gb.get(self.shared.game) or {"ban_terms": []}
         banned = ", ".join(bank.get("ban_terms", []))
 
-        style = PERSONA_STYLE.get(self.p.name, PERSONA_STYLE["knight"])
+        style = _persona_style(self.p.name)
         role = str(style.get("description") or "").strip()
         tone = style["tone"]
         phrasing = style["phrasing"]
         base_temp = float(style["llm_temp"])
 
-        if self.p.name == "sienna":
-            help_mode = True
-
         if help_mode:
             instruction = (
                 f"Write one supportive Twitch chat line. 3-10 words. Tone: {tone}. "
-                f"Style: {phrasing}. Address broadcaster as Divine/Innit/innitdivine. "
+                f"Style: {phrasing}. Address broadcaster as {_alias_text()}. "
                 "Never say streamer. Use Twitch global emote names only. No Unicode emoji."
             )
             temp = max(0.65, base_temp - 0.08)
@@ -330,7 +347,7 @@ class Bot(commands.Bot):
         else:
             instruction = (
                 f"Write one short Twitch reaction. 2-6 words. Tone: {tone}. "
-                f"Style: {phrasing}. Address broadcaster as Divine/Innit/innitdivine. "
+                f"Style: {phrasing}. Address broadcaster as {_alias_text()}. "
                 "Never say streamer. Use Twitch global emote names only. No Unicode emoji."
             )
             temp = base_temp
@@ -383,13 +400,13 @@ class Bot(commands.Bot):
         if bank.get("topics"):
             topic_hint = f" Touch: {self.rng.choice(bank['topics'])}."
 
-        style = PERSONA_STYLE.get(self.p.name, PERSONA_STYLE["knight"])
+        style = _persona_style(self.p.name)
         role = str(style.get("description") or "").strip()
         prompt = (
             f"Quiet stream moment in {g}. Write one short Twitch line (3-10 words). "
             f"Bot role: {role or 'natural Twitch chatter'}. "
             f"Tone: {style['tone']}. Style: {style['phrasing']}. "
-            f"Address Divine/Innit/innitdivine, never streamer. "
+            f"Address {_alias_text()}, never streamer. "
             f"Use Twitch global emote names only, no Unicode emoji. "
             f"Avoid: {banned}.{topic_hint} "
             f"Avoid repeating: {self._recent_hint()}. "

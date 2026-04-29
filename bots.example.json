@@ -1,0 +1,17 @@
+{
+  "bots": [
+    {
+      "name": "samplebot",
+      "username": "example_bot",
+      "env_suffix": "SAMPLEBOT",
+      "message_frequency": [45, 95],
+      "is_moderator": false,
+      "persona": {
+        "description": "Generic sample chatter used until quickstart creates local bots.",
+        "tone": "friendly, calm, natural",
+        "phrasing": "short Twitch chat lines",
+        "llm_temp": 0.75
+      }
+    }
+  ]
+}

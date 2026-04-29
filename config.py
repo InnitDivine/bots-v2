@@ -1,6 +1,8 @@
+import json
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -26,6 +28,11 @@ _load_dotenv()
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _path_env(name: str, default: str) -> Path:
+    path = Path(_env(name, default))
+    return path if path.is_absolute() else ROOT / path
 
 
 def _int_env(name: str, default: int) -> int:
@@ -68,34 +75,92 @@ def is_valid_twitch_token(raw: str) -> bool:
     except ValueError:
         return False
 
-TARGET_CHANNEL = _env("TARGET_CHANNEL", "innitdivine")
+TARGET_CHANNEL = _env("TARGET_CHANNEL", "your_channel")
+PREFERRED_BROADCASTER_NAME = _env("PREFERRED_BROADCASTER_NAME", TARGET_CHANNEL)
+BROADCASTER_ALIASES = [
+    alias.strip()
+    for alias in _env("BROADCASTER_ALIASES", f"{PREFERRED_BROADCASTER_NAME},{TARGET_CHANNEL}").split(",")
+    if alias.strip()
+]
+if not BROADCASTER_ALIASES:
+    BROADCASTER_ALIASES = [TARGET_CHANNEL or "broadcaster"]
 
 TWITCH_CLIENT_ID = _env("TWITCH_CLIENT_ID")
 TWITCH_CLIENT_SECRET = _env("TWITCH_CLIENT_SECRET")
 
-BOTS = [
-    {
-        "name": "sienna",
-        "username": _env("TWITCH_BOT_USERNAME_SIENNA", "example_chillbot"),
-        "token": _env("TWITCH_BOT_TOKEN_SIENNA"),
-        "message_frequency": (35, 80),
-        "is_moderator": False,
-    },
-    {
-        "name": "knight",
-        "username": _env("TWITCH_BOT_USERNAME_KNIGHT", "example_modbot"),
-        "token": _env("TWITCH_BOT_TOKEN_KNIGHT"),
-        "message_frequency": (40, 90),
-        "is_moderator": True,
-    },
-    {
-        "name": "simp",
-        "username": _env("TWITCH_BOT_USERNAME_SIMP", "example_hypebot"),
-        "token": _env("TWITCH_BOT_TOKEN_SIMP"),
-        "message_frequency": (30, 70),
-        "is_moderator": False,
-    },
-]
+BOTS_FILE = _path_env("BOTS_FILE", str(ROOT / "bots.local.json"))
+BOTS_EXAMPLE_FILE = _path_env("BOTS_EXAMPLE_FILE", str(ROOT / "bots.example.json"))
+BOT_NAME_RE = re.compile(r"^[a-z0-9_]{4,25}$")
+
+
+def _env_suffix(name: str) -> str:
+    return re.sub(r"[^A-Z0-9_]+", "_", name.upper()).strip("_")
+
+
+def _message_frequency(raw: Any) -> tuple[int, int]:
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        try:
+            low, high = int(raw[0]), int(raw[1])
+            if low > 0 and high >= low:
+                return low, high
+        except (TypeError, ValueError):
+            pass
+    return 45, 95
+
+
+def _load_bot_payload(path: Path) -> list[Any]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(payload, dict):
+        payload = payload.get("bots", [])
+    return payload if isinstance(payload, list) else []
+
+
+def _bot_from_entry(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    name = str(entry.get("name") or entry.get("username") or "").strip().lower()
+    if not BOT_NAME_RE.fullmatch(name):
+        return None
+
+    suffix = str(entry.get("env_suffix") or _env_suffix(name))
+    username_env = str(entry.get("username_env") or f"TWITCH_BOT_USERNAME_{suffix}")
+    token_env = str(entry.get("token_env") or f"TWITCH_BOT_TOKEN_{suffix}")
+    username_default = str(entry.get("username") or name).strip().lower()
+    persona = entry.get("persona") if isinstance(entry.get("persona"), dict) else {}
+
+    return {
+        "name": name,
+        "username": _env(username_env, username_default),
+        "token": _env(token_env),
+        "message_frequency": _message_frequency(entry.get("message_frequency")),
+        "is_moderator": bool(entry.get("is_moderator", False)),
+        "persona": persona,
+    }
+
+
+def load_bots(path: Path | str | None = None) -> list[dict[str, Any]]:
+    config_path = Path(path) if path else BOTS_FILE
+    entries = _load_bot_payload(config_path)
+    if not entries and config_path != BOTS_EXAMPLE_FILE:
+        entries = _load_bot_payload(BOTS_EXAMPLE_FILE)
+
+    bots: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        bot = _bot_from_entry(entry)
+        if not bot or bot["name"] in seen:
+            continue
+        bots.append(bot)
+        seen.add(bot["name"])
+    return bots
+
+
+BOTS = load_bots()
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-4o-mini")
@@ -152,6 +217,9 @@ def validate_runtime(require_helix: bool = True) -> list[str]:
 
     if not OPENAI_API_KEY:
         errors.append("Missing OPENAI_API_KEY")
+
+    if not BOTS:
+        errors.append("No bots configured; run quickstart.py or create bots.local.json")
 
     for bot in BOTS:
         if not bot["token"]:

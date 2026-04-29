@@ -40,7 +40,7 @@ def _spawn_runner(cwd: str, name: str, args) -> subprocess.Popen:
 def main():
     ap = argparse.ArgumentParser(description="Supervise bot runner processes and restart on exit.")
     ap.add_argument("--bots", default=",".join(_valid_names()))
-    ap.add_argument("--primary", default="sienna", help="Primary bot handles mic/helix unless disabled")
+    ap.add_argument("--primary", default=None, help="Primary bot handles mic/helix unless disabled")
     ap.add_argument("--smoketest", action="store_true")
     ap.add_argument("--send-smoketest-message", action="store_true")
     ap.add_argument("--no-mic", action="store_true")
@@ -53,7 +53,7 @@ def main():
     unknown = [n for n in selected if n not in _valid_names()]
     if unknown:
         raise ValueError(f"Unknown bots: {', '.join(unknown)}")
-    if args.primary not in selected:
+    if not args.primary or args.primary not in selected:
         args.primary = selected[0]
 
     cwd = os.path.abspath(os.path.dirname(__file__))

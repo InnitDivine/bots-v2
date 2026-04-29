@@ -9,10 +9,12 @@ from openai import AsyncOpenAI
 from add_bot_assistant import (
     BotDraft,
     DEFAULT_MESSAGE_FREQUENCY,
+    bot_config_entry,
     generate_persona,
-    update_bot_persona_py,
     update_env_file,
+    upsert_bot_config,
     validate_bot_username,
+    write_bot_config_file,
 )
 from generate_twitch_bot_tokens import get_token_for_account, set_env_value
 
@@ -102,8 +104,17 @@ def _choose_model(env_path: Path) -> str:
 
 def _configure_core_env(env_path: Path) -> dict[str, str]:
     print("\nCore setup")
-    target_channel = _prompt("Target Twitch channel login", "innitdivine")
+    existing_channel = _read_env_value(env_path, "TARGET_CHANNEL")
+    default_channel = "" if existing_channel in {"", "your_channel"} else existing_channel
+    target_channel = _prompt("Target Twitch channel login", default_channel)
+    if not target_channel:
+        raise RuntimeError("TARGET_CHANNEL is required.")
     set_env_value(env_path, "TARGET_CHANNEL", target_channel)
+
+    preferred_name = _prompt("Broadcaster display name", target_channel)
+    set_env_value(env_path, "PREFERRED_BROADCASTER_NAME", preferred_name)
+    aliases = _prompt("Broadcaster aliases, comma-separated", f"{preferred_name},{target_channel}")
+    set_env_value(env_path, "BROADCASTER_ALIASES", aliases)
 
     openai_key = _prompt_secret("OpenAI API key", keep_existing=_env_has_value(env_path, "OPENAI_API_KEY"))
     if openai_key:
@@ -164,42 +175,6 @@ def _configure_transcript(env_path: Path) -> None:
         set_env_value(env_path, "AZURE_SPEECH_KEY", "")
         endpoint = _prompt("HTTP transcript endpoint", DEFAULT_TRANSCRIPT_ENDPOINT)
         set_env_value(env_path, "TRANSCRIPT_HTTP_ENDPOINT", endpoint)
-
-
-def _config_entry_lines(draft: BotDraft) -> list[str]:
-    name = draft.name
-    low, high = draft.message_frequency
-    return [
-        "    {",
-        f'        "name": "{name}",',
-        f'        "username": _env("TWITCH_BOT_USERNAME_{name.upper()}", "{name}"),',
-        f'        "token": _env("TWITCH_BOT_TOKEN_{name.upper()}"),',
-        f'        "message_frequency": ({int(low)}, {int(high)}),',
-        f'        "is_moderator": {bool(draft.is_moderator)},',
-        "    },",
-    ]
-
-
-def _replace_config_bots(drafts: list[BotDraft], config_path: Path = Path("config.py")) -> None:
-    import ast
-
-    tree = ast.parse(config_path.read_text(encoding="utf-8"), filename=str(config_path))
-    target = None
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "BOTS" for t in node.targets):
-            target = node
-            break
-    if target is None or target.end_lineno is None:
-        raise RuntimeError("Could not locate BOTS assignment in config.py.")
-
-    block = ["BOTS = ["]
-    for draft in drafts:
-        block.extend(_config_entry_lines(draft))
-    block.append("]")
-
-    lines = config_path.read_text(encoding="utf-8").splitlines()
-    updated = lines[: target.lineno - 1] + block + lines[target.end_lineno :]
-    config_path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
 
 
 async def _add_bots_loop(env_path: Path, settings: dict[str, str], redirect_uri: str, timeout_s: int) -> list[BotDraft]:
@@ -265,16 +240,13 @@ async def _add_bots_loop(env_path: Path, settings: dict[str, str], redirect_uri:
 def _write_bot_files(env_path: Path, drafts: list[BotDraft], replace_bots: bool) -> None:
     for draft in drafts:
         update_env_file(draft.name, draft.token, env_path=env_path)
-        update_bot_persona_py(draft.name, draft.persona)
 
     if replace_bots:
-        _replace_config_bots(drafts)
-        print("Replaced config.py bot list with quickstart bots.")
+        write_bot_config_file([bot_config_entry(draft) for draft in drafts])
+        print("Replaced local bot list with quickstart bots.")
     else:
-        from add_bot_assistant import update_config_py
-
         for draft in drafts:
-            update_config_py(draft.name, draft.is_moderator, draft.message_frequency)
+            upsert_bot_config(draft)
 
 
 async def main() -> None:
@@ -296,7 +268,7 @@ async def main() -> None:
         return
 
     if drafts:
-        replace_bots = _prompt_bool("Replace sample bot list with only these bots", default=True)
+        replace_bots = _prompt_bool("Replace local bot list with only these bots", default=True)
         _write_bot_files(env_path, drafts, replace_bots=replace_bots)
     else:
         print("No bots added.")

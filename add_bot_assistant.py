@@ -5,7 +5,6 @@ Secrets are written only to .env. Tokens are never printed.
 """
 
 import argparse
-import ast
 import asyncio
 import json
 import re
@@ -15,7 +14,7 @@ from typing import Any, Optional
 
 from openai import AsyncOpenAI
 
-from config import BOTS, OPENAI_API_KEY, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, normalize_twitch_token
+from config import BOTS, BOTS_FILE, OPENAI_API_KEY, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, normalize_twitch_token
 from generate_twitch_bot_tokens import get_token_for_account
 
 USERNAME_RE = re.compile(r"^[a-z0-9_]{4,25}$")
@@ -76,26 +75,6 @@ def validate_persona_json(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError("Persona must be valid JSON.") from exc
     return validate_persona(parsed)
-
-
-def _assignment_node(path: Path, name: str) -> ast.Assign:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
-            if node.end_lineno is None:
-                raise ValueError(f"Cannot locate end of {name} assignment in {path}.")
-            return node
-    raise ValueError(f"Cannot find {name} assignment in {path}.")
-
-
-def _insert_before_assignment_end(path: Path, assignment_name: str, entry_lines: list[str]) -> None:
-    node = _assignment_node(path, assignment_name)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    insert_at = node.end_lineno - 1
-    updated = lines[:insert_at] + entry_lines + lines[insert_at:]
-    path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
 
 
 def _prompt_bool(label: str, default: bool = False) -> bool:
@@ -212,53 +191,58 @@ def update_env_file(bot_name: str, token: str, env_path: Path | str = ".env") ->
     print(f"Updated .env with {username_var_name} and {token_var_name}.")
 
 
-def update_config_py(
-    bot_name: str,
-    is_moderator: bool,
-    message_frequency: tuple[int, int],
-    config_path: Path | str = "config.py",
-) -> None:
-    name = validate_bot_username(bot_name)
-    low, high = int(message_frequency[0]), int(message_frequency[1])
+def bot_config_entry(draft: BotDraft) -> dict[str, Any]:
+    name = validate_bot_username(draft.name)
+    low, high = int(draft.message_frequency[0]), int(draft.message_frequency[1])
     if low <= 0 or high < low:
         raise ValueError("message_frequency must be a positive (min, max) tuple.")
 
-    entry = [
-        "    {",
-        f'        "name": {json.dumps(name)},',
-        f'        "username": _env({json.dumps(f"TWITCH_BOT_USERNAME_{name.upper()}")}, {json.dumps(name)}),',
-        f'        "token": _env({json.dumps(f"TWITCH_BOT_TOKEN_{name.upper()}")}),',
-        f"        \"message_frequency\": ({low}, {high}),",
-        f"        \"is_moderator\": {bool(is_moderator)},",
-        "    },",
-    ]
-    _insert_before_assignment_end(Path(config_path), "BOTS", entry)
-    print(f"Updated config.py with {name}.")
+    env_suffix = name.upper()
+    return {
+        "name": name,
+        "username_env": f"TWITCH_BOT_USERNAME_{env_suffix}",
+        "token_env": f"TWITCH_BOT_TOKEN_{env_suffix}",
+        "message_frequency": [low, high],
+        "is_moderator": bool(draft.is_moderator),
+        "persona": validate_persona(draft.persona),
+    }
 
 
-def update_bot_persona_py(
-    bot_name: str,
-    persona: dict[str, Any],
-    persona_path: Path | str = "bot_persona.py",
-) -> None:
-    name = validate_bot_username(bot_name)
-    safe = validate_persona(persona)
-    entry = [
-        f"    {json.dumps(name)}: {{",
-        f'        "description": {json.dumps(safe["description"])},',
-        f'        "tone": {json.dumps(safe["tone"])},',
-        f'        "phrasing": {json.dumps(safe["phrasing"])},',
-        f'        "llm_temp": {safe["llm_temp"]:.3g},',
-        "    },",
-    ]
-    _insert_before_assignment_end(Path(persona_path), "PERSONA_STYLE", entry)
-    print(f"Updated bot_persona.py with {name}.")
+def read_bot_config_file(path: Path | str = BOTS_FILE) -> list[dict[str, Any]]:
+    bot_path = Path(path)
+    if not bot_path.exists():
+        return []
+    try:
+        payload = json.loads(bot_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{bot_path} is not valid JSON.") from exc
+    if isinstance(payload, dict):
+        bots = payload.get("bots", [])
+    else:
+        bots = payload
+    if not isinstance(bots, list):
+        raise ValueError(f"{bot_path} must contain a bots list.")
+    return [bot for bot in bots if isinstance(bot, dict)]
 
 
-def apply_bot_draft(draft: BotDraft, env_path: Path | str = ".env") -> None:
+def write_bot_config_file(bots: list[dict[str, Any]], path: Path | str = BOTS_FILE) -> None:
+    bot_path = Path(path)
+    bot_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"bots": bots}
+    bot_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"Updated {bot_path}.")
+
+
+def upsert_bot_config(draft: BotDraft, path: Path | str = BOTS_FILE) -> None:
+    entry = bot_config_entry(draft)
+    bots = [bot for bot in read_bot_config_file(path) if str(bot.get("name", "")).lower() != entry["name"]]
+    bots.append(entry)
+    write_bot_config_file(bots, path=path)
+
+
+def apply_bot_draft(draft: BotDraft, env_path: Path | str = ".env", bots_path: Path | str = BOTS_FILE) -> None:
     update_env_file(draft.name, draft.token, env_path=env_path)
-    update_config_py(draft.name, draft.is_moderator, draft.message_frequency)
-    update_bot_persona_py(draft.name, draft.persona)
+    upsert_bot_config(draft, path=bots_path)
 
 
 async def collect_bot_drafts(args: argparse.Namespace) -> list[BotDraft]:
@@ -321,6 +305,7 @@ async def main() -> None:
     parser.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI, help="Twitch OAuth redirect URI")
     parser.add_argument("--timeout", type=int, default=180, help="OAuth timeout per bot in seconds")
     parser.add_argument("--env-path", default=".env", help="Env file to update")
+    parser.add_argument("--bots-path", default=str(BOTS_FILE), help="Local bot JSON file to update")
     parser.add_argument("--model", default="gpt-4o-mini", help="OpenAI model for persona generation")
     args = parser.parse_args()
 
@@ -345,12 +330,12 @@ async def main() -> None:
         mod = "moderator" if draft.is_moderator else "chatter"
         print(f"- {draft.name}: {draft.persona['description']} ({mod})")
 
-    if not _prompt_bool("Write .env, config.py, and bot_persona.py now", default=True):
+    if not _prompt_bool("Write .env and bots.local.json now", default=True):
         print("No files changed.")
         return
 
     for draft in drafts:
-        apply_bot_draft(draft, env_path=args.env_path)
+        apply_bot_draft(draft, env_path=args.env_path, bots_path=args.bots_path)
 
     print("\n" + "=" * 50)
     print(f"Bot setup complete. Added {len(drafts)} bot(s).")

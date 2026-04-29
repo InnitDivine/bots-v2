@@ -24,6 +24,8 @@ python quickstart.py
 
 Quickstart asks for Twitch app credentials, OpenAI settings, optional Azure/HTTP transcript settings, then lets you add bot accounts one at a time. Bot login uses the local Twitch OAuth callback and writes tokens to `.env`.
 
+Quickstart writes real bot accounts and AI-generated personas to ignored `bots.local.json`. The tracked `bots.example.json` is only a generic sample.
+
 Or add more bot accounts later:
 
 ```powershell
@@ -35,7 +37,7 @@ python add_bot_assistant.py --count 3
 Safe connect-only check:
 
 ```powershell
-python runner.py --bot sienna --smoketest --no-mic --no-helix
+python runner.py --bot <botname> --smoketest --no-mic --no-helix
 ```
 
 Launch all bots:
@@ -53,6 +55,7 @@ python launch_multi.py --use-watchdog
 ## Notes
 
 - Leave token fields blank in `.env.example`; real tokens belong only in `.env`.
+- Real bot usernames/personas belong in ignored `bots.local.json`, not tracked Python files.
 - Tokens must use the `oauth:` prefix and placeholder values are rejected.
 - Runtime files, logs, caches, shared JSON state, and `.env` are ignored.
 - Smoketest does not send chat unless `--send-smoketest-message` is passed.
