@@ -1,0 +1,15 @@
+.env export-ignore
+.env.* export-ignore
+.env.example -export-ignore
+run/ export-ignore
+logs/ export-ignore
+heartbeats/ export-ignore
+shared_transcript.json export-ignore
+shared_meta.json export-ignore
+recent_messages.json export-ignore
+__pycache__/ export-ignore
+.pytest_cache/ export-ignore
+*.pyc export-ignore
+*.log export-ignore
+*.tmp export-ignore
+*.lock export-ignore

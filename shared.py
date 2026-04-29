@@ -1,0 +1,321 @@
+import contextlib
+import hashlib
+import json
+import os
+import re
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+try:
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover - Windows path
+    fcntl = None
+
+try:
+    import msvcrt  # type: ignore
+except ImportError:  # pragma: no cover - POSIX path
+    msvcrt = None
+
+LOCK_TIMEOUT_S = 5.0
+LOCK_POLL_S = 0.025
+_INPROC_LOCKS: dict[str, threading.RLock] = {}
+_INPROC_LOCKS_GUARD = threading.Lock()
+
+HYPE_TERMS = {"lets go", "let s go", "pog", "poggers", "huge", "clutch", "gg", "w"}
+FAIL_TERMS = {"rip", "unlucky", "oof", "fail", "lost", "dead", "bad run", "throw"}
+HELP_TERMS = {"help", "how", "what", "why", "where", "when", "which", "plan", "build"}
+
+
+def _h12(text: str) -> str:
+    return hashlib.sha1((text or "").encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def _norm_msg(msg: str) -> str:
+    msg = (msg or "").lower().strip()
+    msg = re.sub(r"[^a-z0-9]+", " ", msg)
+    return re.sub(r"\s+", " ", msg).strip()
+
+
+def _fallback_copy(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
+@contextmanager
+def _file_lock(target: Path) -> Iterator[None]:
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    key = str(lock_path.resolve())
+    with _INPROC_LOCKS_GUARD:
+        inproc_lock = _INPROC_LOCKS.setdefault(key, threading.RLock())
+    inproc_lock.acquire()
+    try:
+        with lock_path.open("a+b") as handle:
+            handle.seek(0)
+            handle.write(b"\0")
+            handle.flush()
+            handle.seek(0)
+            start = time.time()
+            locked = False
+            while not locked:
+                try:
+                    if msvcrt is not None:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    elif fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except OSError:
+                    if time.time() - start >= LOCK_TIMEOUT_S:
+                        raise TimeoutError(f"Timed out waiting for lock: {target.name}")
+                    time.sleep(LOCK_POLL_S)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if msvcrt is not None:
+                    with contextlib.suppress(OSError):
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                elif fcntl is not None:
+                    with contextlib.suppress(OSError):
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        inproc_lock.release()
+
+
+def _read_json(path: Path, fallback: Any) -> Any:
+    for _ in range(3):
+        if not path.exists():
+            return _fallback_copy(fallback)
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            time.sleep(0.02)
+        except OSError:
+            time.sleep(0.02)
+    return _fallback_copy(fallback)
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def _prune_messages(messages: list[Any], now: float, ttl_s: float) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for row in messages:
+        if not isinstance(row, dict):
+            continue
+        try:
+            ts = float(row.get("ts", 0))
+        except (TypeError, ValueError):
+            continue
+        if now - ts <= ttl_s:
+            kept.append(row)
+    return kept
+
+
+def _text_signals(text: str) -> tuple[int, str, bool]:
+    norm = _norm_msg(text)
+    words = set(norm.split())
+    has_hype = any(term in norm for term in HYPE_TERMS)
+    has_fail = any(term in norm for term in FAIL_TERMS)
+    help_mode = "?" in text or bool(words & HELP_TERMS)
+    if has_hype:
+        return 9, "hype", help_mode
+    if has_fail:
+        return 2, "fail", help_mode
+    return 0, "neutral", help_mode
+
+
+class SharedState:
+    """Per-process state with cross-process transcript + dedupe files."""
+
+    def __init__(self, transcript_path: str, recent_messages_path: str, meta_path: str | None = None):
+        self.transcript_path = Path(transcript_path)
+        self.recent_messages_path = Path(recent_messages_path)
+        self.meta_path = Path(meta_path) if meta_path else None
+        self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        self.recent_messages_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.meta_path is not None:
+            self.meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.game: str = ""
+        self.global_emotes: list[str] = []
+        self.hype: int = 0
+        self.detected_emotion: str = "neutral"
+        self.help_mode: bool = False
+
+        self.silence: float = 0.0
+        self.latest_text: str = ""
+        self.latest_id: str = ""
+
+    def tick(self, dt: float) -> None:
+        self.silence += max(0.0, float(dt))
+
+    def set_game(self, name: str) -> None:
+        self.game = (name or "").strip()
+        self._merge_meta({"game": self.game})
+
+    def set_global_emotes(self, names: list[str]) -> None:
+        self.global_emotes = names or []
+        self._merge_meta({"global_emotes": self.global_emotes})
+
+    def on_text(self, text: str, final: bool = True) -> None:
+        if not final:
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+
+        line_id = _h12(text + str(int(time.time() * 1000)))
+        hype, emotion, help_mode = _text_signals(text)
+        self.hype = hype if hype else max(0, self.hype - 1)
+        self.detected_emotion = emotion
+        self.help_mode = help_mode
+        self.latest_text = text
+        self.latest_id = line_id
+        self.silence = 0.0
+        self._write_transcript(text, line_id)
+        self._merge_meta(
+            {
+                "hype": self.hype,
+                "detected_emotion": self.detected_emotion,
+                "help_mode": self.help_mode,
+            }
+        )
+
+    def _write_transcript(self, text: str, line_id: str) -> None:
+        payload: dict[str, Any] = {
+            "id": line_id,
+            "text": text,
+            "ts": time.time(),
+        }
+        with _file_lock(self.transcript_path):
+            _atomic_write_json(self.transcript_path, payload)
+
+    def refresh_transcript(self) -> None:
+        with _file_lock(self.transcript_path):
+            data = _read_json(self.transcript_path, {})
+        if not isinstance(data, dict):
+            return
+
+        line_id = (data.get("id") or "").strip()
+        text = (data.get("text") or "").strip()
+        if not line_id or not text:
+            return
+        if line_id == self.latest_id:
+            return
+
+        self.latest_id = line_id
+        self.latest_text = text
+        self.silence = 0.0
+
+    def _merge_meta(self, updates: dict[str, Any]) -> None:
+        if self.meta_path is None:
+            return
+        payload = {**updates, "ts": time.time()}
+        with _file_lock(self.meta_path):
+            existing = _read_json(self.meta_path, {})
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(payload)
+            _atomic_write_json(self.meta_path, existing)
+
+    def refresh_meta(self) -> None:
+        if self.meta_path is None:
+            return
+        with _file_lock(self.meta_path):
+            data = _read_json(self.meta_path, {})
+        if not isinstance(data, dict):
+            return
+        game = (data.get("game") or "").strip()
+        emotes = data.get("global_emotes")
+        if game:
+            self.game = game
+        if isinstance(emotes, list):
+            self.global_emotes = [str(x) for x in emotes if str(x).strip()]
+        if "hype" in data:
+            try:
+                self.hype = max(0, min(10, int(data["hype"])))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(data.get("detected_emotion"), str):
+            self.detected_emotion = data["detected_emotion"].strip() or "neutral"
+        if isinstance(data.get("help_mode"), bool):
+            self.help_mode = data["help_mode"]
+
+    def _read_recent_payload_unlocked(self) -> dict[str, Any]:
+        data = _read_json(self.recent_messages_path, {"messages": []})
+        if isinstance(data, dict) and isinstance(data.get("messages"), list):
+            return data
+        return {"messages": []}
+
+    def _write_recent_payload_unlocked(self, data: dict[str, Any]) -> None:
+        _atomic_write_json(self.recent_messages_path, data)
+
+    def prune_recent_messages(self, ttl_s: float = 120.0) -> None:
+        now = time.time()
+        with _file_lock(self.recent_messages_path):
+            data = self._read_recent_payload_unlocked()
+            data["messages"] = _prune_messages(data.get("messages", []), now, ttl_s)
+            self._write_recent_payload_unlocked(data)
+
+    def is_global_duplicate(self, message: str, ttl_s: float = 120.0) -> bool:
+        norm = _norm_msg(message)
+        if not norm:
+            return False
+        now = time.time()
+        with _file_lock(self.recent_messages_path):
+            data = self._read_recent_payload_unlocked()
+            kept = _prune_messages(data.get("messages", []), now, ttl_s)
+            dup = any(row.get("norm") == norm for row in kept)
+            data["messages"] = kept
+            self._write_recent_payload_unlocked(data)
+        return dup
+
+    def try_remember_global_message(
+        self,
+        bot_name: str,
+        message: str,
+        ttl_s: float = 120.0,
+        max_per_minute: int | None = None,
+        min_interval_s: float = 0.0,
+    ) -> bool:
+        norm = _norm_msg(message)
+        if not norm:
+            return False
+        now = time.time()
+        with _file_lock(self.recent_messages_path):
+            data = self._read_recent_payload_unlocked()
+            kept = _prune_messages(data.get("messages", []), now, ttl_s)
+            if any(row.get("norm") == norm for row in kept):
+                data["messages"] = kept
+                self._write_recent_payload_unlocked(data)
+                return False
+            if max_per_minute is not None and max_per_minute >= 0:
+                minute_count = sum(1 for row in kept if now - float(row.get("ts", 0)) <= 60.0)
+                if minute_count >= max_per_minute:
+                    data["messages"] = kept
+                    self._write_recent_payload_unlocked(data)
+                    return False
+            if min_interval_s > 0 and kept:
+                latest = max(float(row.get("ts", 0)) for row in kept)
+                if now - latest < min_interval_s:
+                    data["messages"] = kept
+                    self._write_recent_payload_unlocked(data)
+                    return False
+            kept.append({"bot": bot_name, "norm": norm, "raw": message, "ts": now})
+            data["messages"] = kept[-120:]
+            self._write_recent_payload_unlocked(data)
+        return True
+
+    def remember_global_message(self, bot_name: str, message: str, ttl_s: float = 120.0) -> None:
+        self.try_remember_global_message(bot_name, message, ttl_s=ttl_s)

@@ -1,0 +1,536 @@
+import asyncio
+import hashlib
+import os
+import random
+import re
+import time
+from collections import deque
+from datetime import datetime
+from typing import Optional
+
+from openai import AsyncOpenAI
+from twitchio.ext import commands
+
+from config import (
+    BASE_MIN_COOLDOWN_SECS,
+    FALLBACK_QUESTIONS,
+    GLOBAL_MAX_MSG_PER_MINUTE,
+    GLOBAL_MIN_COOLDOWN_SECS,
+    LLM_MAX_TOKENS,
+    MAX_MSG_PER_MINUTE,
+    OPENAI_MODEL,
+    REALISTIC_MESSAGES,
+    BOTS,
+    TARGET_CHANNEL,
+    TYPING_PATTERNS,
+)
+from gamebank import GameBankManager
+from shared import SharedState
+
+LURK_MIN_SEC = 60
+LURK_MAX_SEC = 240
+BACKGROUND_MIN_SILENCE = 45.0
+BACKGROUND_LLM_PROB = 0.35
+MAX_WORDS = 12
+LLM_TIMEOUT_S = 10.0
+RECENT_LOCAL_LINES = 8
+RECENT_CHAT_CONTEXT = 12
+RECENT_HINT_WINDOW = 6
+RECENT_MIC_LINES = 8
+
+STREAMER_ALIASES = ["Divine", "Innit", "innitdivine"]
+PREFERRED_NAME = "Divine"
+
+PERSONA_STYLE = {
+    "sienna": {
+        "tone": "supportive, chill, conversational",
+        "phrasing": "soft hype, asks friendly follow-ups",
+        "llm_temp": 0.75,
+    },
+    "knight": {
+        "tone": "confident, analytical, slightly competitive",
+        "phrasing": "short takes about decisions and execution",
+        "llm_temp": 0.8,
+    },
+    "simp": {
+        "tone": "hype-heavy, meme-first, playful",
+        "phrasing": "fast reactions and clip-callouts",
+        "llm_temp": 0.9,
+    },
+}
+
+
+def _sha12(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def _swap_streamer_alias(rng: random.Random, msg: Optional[str]) -> Optional[str]:
+    if not msg:
+        return msg
+    alias = PREFERRED_NAME if rng.random() < 0.7 else rng.choice(STREAMER_ALIASES)
+    msg = re.sub(r"\bthe streamer\b", alias, msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bstreamer\b", alias, msg, flags=re.IGNORECASE)
+    return msg
+
+
+def _norm_message(msg: str) -> str:
+    msg = (msg or "").lower().strip()
+    msg = re.sub(r"[^a-z0-9]+", " ", msg)
+    return re.sub(r"\s+", " ", msg).strip()
+
+
+def _is_callout_request(text: str) -> bool:
+    t = _norm_message(text)
+    if not t:
+        return False
+    triggers = [
+        "who is in chat",
+        "whos in chat",
+        "roll call",
+        "call out",
+        "callout",
+        "anyone in chat",
+    ]
+    return any(x in t for x in triggers)
+
+
+class Persona:
+    def __init__(
+        self,
+        name: str,
+        username: str,
+        token: str,
+        message_frequency: tuple[int, int],
+        is_moderator: bool = False,
+    ):
+        self.name = name
+        self.username = username
+        self.token = token
+        self.message_frequency = message_frequency
+        self.is_moderator = bool(is_moderator)
+
+
+class Bot(commands.Bot):
+    def __init__(self, persona: Persona, ai: AsyncOpenAI, shared: SharedState, gb: GameBankManager):
+        super().__init__(token=persona.token.strip(), prefix="!", initial_channels=[TARGET_CHANNEL], nick=persona.username)
+        self.p = persona
+        self.ai = ai
+        self.shared = shared
+        self.gb = gb
+
+        self.rng = random.Random(f"{self.p.name}-{os.getpid()}")
+        self._last_sent_at = 0.0
+        self._last_seen_mic_id = ""
+        self._lurk_until = 0.0
+        self._chat_task: Optional[asyncio.Task] = None
+        self._closing = False
+        self._sent_window: deque[float] = deque(maxlen=MAX_MSG_PER_MINUTE * 2)
+        self._recent_local_lines: deque[str] = deque(maxlen=RECENT_LOCAL_LINES)
+        self._recent_chat: deque[tuple[str, str, float]] = deque(maxlen=RECENT_CHAT_CONTEXT)
+        self._recent_mic_lines: deque[str] = deque(maxlen=RECENT_MIC_LINES)
+        self._bot_usernames = {b["username"].strip().lower() for b in BOTS if b.get("username")}
+
+    async def event_ready(self):
+        print(f"{self.p.name} connected as {self.nick}")
+        if self._chat_task is None or self._chat_task.done():
+            self._chat_task = asyncio.create_task(self.chat_loop(), name=f"{self.p.name}_chat_loop")
+
+    async def event_message(self, message):
+        # Read real channel chat context (cross-chat awareness).
+        try:
+            if message.echo:
+                return
+            author = ""
+            if message.author is not None and getattr(message.author, "name", None):
+                author = str(message.author.name).strip()
+            text = (message.content or "").strip()
+            if not author or not text:
+                return
+
+            # Ignore our bot trio for context; keep real chatter and broadcaster lines.
+            if author.lower() in self._bot_usernames:
+                return
+            self._recent_chat.append((author, text, time.time()))
+        except Exception:
+            return
+
+    async def event_disconnect(self):
+        if self._chat_task and not self._chat_task.done():
+            self._chat_task.cancel()
+            await asyncio.gather(self._chat_task, return_exceptions=True)
+        self._chat_task = None
+
+    async def close(self):
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            if self._chat_task and not self._chat_task.done():
+                self._chat_task.cancel()
+                await asyncio.gather(self._chat_task, return_exceptions=True)
+            self._chat_task = None
+            await super().close()
+        finally:
+            self._closing = False
+
+    def _adaptive_cooldown(self) -> float:
+        base = float(BASE_MIN_COOLDOWN_SECS)
+        if self.shared.hype > 7:
+            return max(8.0, base - 2.0)
+        if self.shared.silence > 30:
+            return min(20.0, base + 3.0)
+        return base
+
+    def _cooldown_ok(self) -> bool:
+        return (time.time() - self._last_sent_at) >= self._adaptive_cooldown()
+
+    def _rate_limit_ok(self) -> bool:
+        now = time.time()
+        while self._sent_window and now - self._sent_window[0] > 60.0:
+            self._sent_window.popleft()
+        return len(self._sent_window) < MAX_MSG_PER_MINUTE
+
+    def _can_send_now(self) -> bool:
+        return self._cooldown_ok() and self._rate_limit_ok()
+
+    def _mark_sent(self):
+        self._last_sent_at = time.time()
+        self._sent_window.append(self._last_sent_at)
+
+    def _lurk_active(self) -> bool:
+        return time.time() < self._lurk_until
+
+    def _maybe_enter_lurk(self):
+        p = 0.14 if self.p.name == "sienna" else (0.10 if self.p.name == "simp" else 0.07)
+        if self.rng.random() < p:
+            dur = self.rng.randint(LURK_MIN_SEC, LURK_MAX_SEC)
+            self._lurk_until = time.time() + dur
+
+    def _emote_only(self) -> str:
+        pool = self.shared.global_emotes or ["Kappa", "LUL", "PogChamp", "4Head", "TriHard", "SeemsGood"]
+        return self.rng.choice(pool)
+
+    def _stock(self, ctx: str) -> str:
+        if ctx == "hype":
+            msg = self.rng.choice(REALISTIC_MESSAGES["hype"])
+        elif ctx == "fail":
+            msg = self.rng.choice(REALISTIC_MESSAGES["fail"])
+        elif ctx == "question":
+            msg = self.rng.choice(REALISTIC_MESSAGES["question"])
+        elif self.rng.random() < 0.3:
+            msg = self.rng.choice(REALISTIC_MESSAGES["memes"])
+        else:
+            msg = self.rng.choice(REALISTIC_MESSAGES["casual"])
+
+        if self.rng.random() < TYPING_PATTERNS.get("all_lowercase", 0.6):
+            msg = msg.lower()
+        elif self.rng.random() < TYPING_PATTERNS.get("all_caps", 0.10) and len(msg) < 24:
+            msg = msg.upper()
+
+        if self.rng.random() < TYPING_PATTERNS.get("no_punctuation", 0.75):
+            msg = msg.replace("?", "").replace("!", "").replace(".", "")
+        return msg
+
+    def _game_question(self) -> str:
+        bank = self.gb.get(self.shared.game)
+        if bank and bank.get("questions"):
+            return self.rng.choice(bank["questions"])
+        return self.rng.choice(FALLBACK_QUESTIONS)
+
+    def _direct_callout(self) -> str:
+        base = [
+            f"{self.p.username} here Divine",
+            f"im here Innit",
+            f"{self.p.username} in chat",
+            "here with you Divine",
+        ]
+        msg = self.rng.choice(base)
+        if self.rng.random() < 0.35:
+            msg = f"{msg} {self._emote_only()}"
+        return msg
+
+    def _sanitize(self, msg: Optional[str]) -> Optional[str]:
+        if not msg:
+            return None
+        msg = _swap_streamer_alias(self.rng, msg)
+        msg = msg.encode("ascii", "ignore").decode("ascii")
+        msg = re.sub(r"\s+", " ", msg).strip()
+        if not msg:
+            return None
+
+        bank = self.gb.get(self.shared.game)
+        if bank:
+            for t in bank.get("ban_terms", []):
+                if t.lower() in msg.lower():
+                    return None
+
+        words = msg.split()
+        if len(words) > MAX_WORDS:
+            msg = " ".join(words[:MAX_WORDS])
+        return msg
+
+    def _recent_hint(self) -> str:
+        if not self._recent_local_lines:
+            return "none"
+        return " | ".join(list(self._recent_local_lines)[-RECENT_HINT_WINDOW:])
+
+    def _chat_hint(self) -> str:
+        if not self._recent_chat:
+            return "none"
+        rows = []
+        for author, text, _ts in list(self._recent_chat)[-RECENT_HINT_WINDOW:]:
+            rows.append(f"{author}: {text}")
+        return " | ".join(rows)
+
+    def _mic_hint(self) -> str:
+        if not self._recent_mic_lines:
+            return "none"
+        return " | ".join(list(self._recent_mic_lines)[-RECENT_HINT_WINDOW:])
+
+    def _gamebank_hint(self) -> str:
+        bank = self.gb.get(self.shared.game) or {}
+        topics = bank.get("topics") or []
+        questions = bank.get("questions") or []
+        t = ", ".join([str(x) for x in topics[:4]]) if topics else "none"
+        q = ", ".join([str(x) for x in questions[:3]]) if questions else "none"
+        return f"topics={t}; likely_questions={q}"
+
+    def _record_local_line(self, message: str):
+        self._recent_local_lines.append(message)
+
+    def _is_local_duplicate(self, message: str) -> bool:
+        norm = _norm_message(message)
+        if not norm:
+            return False
+        return any(_norm_message(row) == norm for row in self._recent_local_lines)
+
+    async def _ai(self, source_text: str, help_mode: bool) -> Optional[str]:
+        g = self.shared.game or "the game"
+        bank = self.gb.get(self.shared.game) or {"ban_terms": []}
+        banned = ", ".join(bank.get("ban_terms", []))
+
+        style = PERSONA_STYLE.get(self.p.name, PERSONA_STYLE["knight"])
+        tone = style["tone"]
+        phrasing = style["phrasing"]
+        base_temp = float(style["llm_temp"])
+
+        if self.p.name == "sienna":
+            help_mode = True
+
+        if help_mode:
+            instruction = (
+                f"Write one supportive Twitch chat line. 3-10 words. Tone: {tone}. "
+                f"Style: {phrasing}. Address broadcaster as Divine/Innit/innitdivine. "
+                "Never say streamer. Use Twitch global emote names only. No Unicode emoji."
+            )
+            temp = max(0.65, base_temp - 0.08)
+            quoted = source_text[-180:]
+        else:
+            instruction = (
+                f"Write one short Twitch reaction. 2-6 words. Tone: {tone}. "
+                f"Style: {phrasing}. Address broadcaster as Divine/Innit/innitdivine. "
+                "Never say streamer. Use Twitch global emote names only. No Unicode emoji."
+            )
+            temp = base_temp
+            quoted = source_text[-140:]
+
+        if self.p.is_moderator:
+            instruction += (
+                " You are a moderator in this channel, so keep lines constructive and de-escalating."
+            )
+
+        prompt = (
+            f"broadcaster words: '{quoted}'\n"
+            f"game: {g}\n"
+            f"gamebank hints: {self._gamebank_hint()}\n"
+            f"recent broadcaster context: {self._mic_hint()}\n"
+            f"recent real chat context: {self._chat_hint()}\n"
+            f"avoid terms: {banned}\n"
+            f"recent lines to avoid repeating: {self._recent_hint()}\n"
+            "Grounding rule: do not invent specifics. If unsure, ask a short clarifying question.\n"
+            f"{instruction}"
+        )
+
+        try:
+            resp = await asyncio.wait_for(
+                self.ai.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a realistic Twitch chatter."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=LLM_MAX_TOKENS,
+                    temperature=temp,
+                ),
+                timeout=LLM_TIMEOUT_S,
+            )
+            msg = (resp.choices[0].message.content or "").strip()
+            msg = re.sub(r"\s+", " ", msg)
+            return self._sanitize(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+
+    async def _ai_background(self) -> Optional[str]:
+        g = self.shared.game or "the game"
+        bank = self.gb.get(self.shared.game) or {}
+        banned = ", ".join(bank.get("ban_terms") or [])
+        topic_hint = ""
+        if bank.get("topics"):
+            topic_hint = f" Touch: {self.rng.choice(bank['topics'])}."
+
+        style = PERSONA_STYLE.get(self.p.name, PERSONA_STYLE["knight"])
+        prompt = (
+            f"Quiet stream moment in {g}. Write one short Twitch line (3-10 words). "
+            f"Tone: {style['tone']}. Style: {style['phrasing']}. "
+            f"Address Divine/Innit/innitdivine, never streamer. "
+            f"Use Twitch global emote names only, no Unicode emoji. "
+            f"Avoid: {banned}.{topic_hint} "
+            f"Avoid repeating: {self._recent_hint()}. "
+            f"Recent real chat context: {self._chat_hint()}. "
+            f"Recent broadcaster context: {self._mic_hint()}. "
+            f"Gamebank hints: {self._gamebank_hint()}. "
+            "Grounding rule: do not invent specifics."
+        )
+        if self.p.is_moderator:
+            prompt += " Keep moderator energy: calm, positive, and chat-safe."
+
+        try:
+            resp = await asyncio.wait_for(
+                self.ai.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a realistic Twitch chatter."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=LLM_MAX_TOKENS,
+                    temperature=float(style["llm_temp"]),
+                ),
+                timeout=LLM_TIMEOUT_S,
+            )
+            msg = (resp.choices[0].message.content or "").strip()
+            msg = re.sub(r"\s+", " ", msg)
+            return self._sanitize(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+
+    def _diversify(self, message: Optional[str], ctx: str, help_mode: bool) -> Optional[str]:
+        if not message:
+            return None
+        if not self._is_local_duplicate(message) and not self.shared.is_global_duplicate(message):
+            return message
+
+        for _ in range(4):
+            if help_mode and self.rng.random() < 0.45:
+                alt = self._game_question()
+            elif self.rng.random() < 0.35:
+                alt = self._emote_only()
+            else:
+                alt = self._stock(ctx)
+            alt = self._sanitize(alt)
+            if alt and not self._is_local_duplicate(alt) and not self.shared.is_global_duplicate(alt):
+                return alt
+        return None
+
+    async def chat_loop(self):
+        await asyncio.sleep(self.rng.uniform(3, 8))
+        print(f"{self.p.name} chat loop started")
+
+        while True:
+            try:
+                minw, maxw = self.p.message_frequency
+                wait = self.rng.randint(minw, maxw)
+                new_mic_pending = False
+                remaining = float(wait)
+                while remaining > 0:
+                    step = 1.0 if remaining > 1.0 else remaining
+                    await asyncio.sleep(step)
+                    self.shared.tick(step)
+                    self.shared.refresh_transcript()
+                    self.shared.refresh_meta()
+                    remaining -= step
+                    if (
+                        self.shared.latest_id
+                        and self.shared.latest_id != self._last_seen_mic_id
+                        and self._can_send_now()
+                    ):
+                        new_mic_pending = True
+                        break
+
+                urgent = self.shared.help_mode or (self.shared.hype > 7)
+                if self._lurk_active() and not urgent:
+                    continue
+                if self._lurk_active() and urgent:
+                    self._lurk_until = 0.0
+
+                help_mode = self.shared.help_mode or (self.shared.silence > 16)
+                if self.shared.detected_emotion == "hype":
+                    ctx = "hype"
+                elif self.shared.detected_emotion == "fail":
+                    ctx = "fail"
+                elif self.rng.random() < 0.1:
+                    ctx = "question"
+                else:
+                    ctx = "general"
+
+                message: Optional[str] = None
+
+                if (
+                    self.shared.latest_text
+                    and self.shared.latest_id
+                    and self._can_send_now()
+                    and (new_mic_pending or self.shared.latest_id != self._last_seen_mic_id)
+                ):
+                    if self.shared.latest_id != self._last_seen_mic_id:
+                        self._last_seen_mic_id = self.shared.latest_id
+                        self._recent_mic_lines.append(self.shared.latest_text)
+                        if _is_callout_request(self.shared.latest_text):
+                            m = self._direct_callout()
+                        else:
+                            m = await self._ai(self.shared.latest_text, help_mode=help_mode)
+                        if not m:
+                            m = self._game_question() if (help_mode or ctx == "question") else None
+                        message = m or (self._emote_only() if self.rng.random() < 0.3 else self._stock(ctx))
+
+                if not message and self._can_send_now() and self.shared.silence >= BACKGROUND_MIN_SILENCE:
+                    if self.rng.random() < BACKGROUND_LLM_PROB:
+                        message = await self._ai_background()
+
+                if not message and self._can_send_now() and self.shared.hype > 7:
+                    message = self._emote_only()
+                    self.shared.hype = 5
+
+                if not message and self._can_send_now() and self.rng.random() < 0.08:
+                    message = self._stock(ctx)
+
+                message = self._sanitize(message)
+                message = self._diversify(message, ctx=ctx, help_mode=help_mode)
+
+                if message:
+                    ch = self.connected_channels[0] if self.connected_channels else self.get_channel(TARGET_CHANNEL)
+                    reserved = False
+                    if ch is not None:
+                        reserved = self.shared.try_remember_global_message(
+                            self.p.name,
+                            message,
+                            max_per_minute=GLOBAL_MAX_MSG_PER_MINUTE,
+                            min_interval_s=GLOBAL_MIN_COOLDOWN_SECS,
+                        )
+                    if ch is not None and reserved:
+                        await ch.send(message)
+                        self._mark_sent()
+                        self._record_local_line(message)
+                        tag = "HELP" if help_mode else "NORMAL"
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.p.name} -> '{message}' [{tag}/{ctx.upper()}]")
+
+                if not urgent and not self._lurk_active():
+                    self._maybe_enter_lurk()
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"chat_loop error ({self.p.name}): {e}")
+                await asyncio.sleep(5)
