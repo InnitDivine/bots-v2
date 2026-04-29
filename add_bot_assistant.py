@@ -9,15 +9,14 @@ import ast
 import asyncio
 import json
 import re
-import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import parse_qs, urlencode, urlparse
 
 from openai import AsyncOpenAI
 
-from config import BOTS, OPENAI_API_KEY, TWITCH_CLIENT_ID, normalize_twitch_token
+from config import BOTS, OPENAI_API_KEY, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, normalize_twitch_token
+from generate_twitch_bot_tokens import get_token_for_account
 
 USERNAME_RE = re.compile(r"^[a-z0-9_]{4,25}$")
 DEFAULT_MESSAGE_FREQUENCY = (45, 95)
@@ -128,36 +127,24 @@ def _prompt_usernames(count: int | None = None) -> list[str]:
     return names
 
 
-async def get_bot_token(bot_username: str, redirect_uri: str, client_id: str) -> Optional[str]:
-    params = {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "token",
-        "scope": "chat:read chat:edit",
-        "force_verify": "true",
-        "login": bot_username,
-    }
-    auth_url = f"https://id.twitch.tv/oauth2/authorize?{urlencode(params)}"
-
-    print("\n" + "=" * 50)
-    print(f"Twitch Authentication: {bot_username}")
-    print("=" * 50)
-    print("A browser window will open for Twitch authorization.")
-    print(f"Log in as bot account: {bot_username}")
-    print("After approval, copy the full redirected URL.")
-
-    webbrowser.open(auth_url)
-    redirect_url = input("Paste the full redirect URL here: ").strip()
-    parsed = urlparse(redirect_url)
-    params = parse_qs(parsed.fragment or parsed.query)
-    token = (params.get("access_token") or [""])[0]
-    if not token:
-        print("Error: could not find access_token in the URL.")
-        return None
+async def get_bot_token(
+    bot_username: str,
+    redirect_uri: str,
+    client_id: str,
+    client_secret: str,
+    timeout_s: int,
+) -> Optional[str]:
     try:
-        return normalize_twitch_token(token)
-    except ValueError:
-        print("Error: Twitch token format looked invalid.")
+        return await asyncio.to_thread(
+            get_token_for_account,
+            client_id=client_id,
+            client_secret=client_secret,
+            username=bot_username,
+            redirect_uri=redirect_uri,
+            timeout_s=timeout_s,
+        )
+    except Exception as exc:
+        print(f"Token generation failed for {bot_username}: {exc}")
         return None
 
 
@@ -167,6 +154,7 @@ async def generate_persona(
     direction: str,
     squad_direction: str,
     existing_descriptions: list[str],
+    model: str = "gpt-4o-mini",
 ) -> Optional[dict[str, Any]]:
     direction_text = direction or "No specific direction. Choose a useful distinct role for this bot."
     existing_text = "\n".join(f"- {line}" for line in existing_descriptions) or "none yet"
@@ -191,7 +179,7 @@ Keep it distinct from existing bot roles. Keep it safe, natural, and Twitch-chat
     print(f"\nGenerating AI persona for {bot_name}...")
     try:
         response = await ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model,
             messages=[
                 {"role": "system", "content": "Return only valid JSON for a safe Twitch bot persona."},
                 {"role": "user", "content": prompt},
@@ -298,13 +286,13 @@ async def collect_bot_drafts(args: argparse.Namespace) -> list[BotDraft]:
         print("\n" + "-" * 50)
         print(f"Setting up bot {index}/{len(names)}: {name}")
 
-        token = await get_bot_token(name, args.redirect_uri, TWITCH_CLIENT_ID)
+        token = await get_bot_token(name, args.redirect_uri, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, args.timeout)
         if not token:
             print("Failed to get token. Aborting before writing any new bot config.")
             return []
 
         direction = input("Describe what this bot should be like, or press Enter for AI to choose: ").strip()
-        persona = await generate_persona(ai_client, name, direction, squad_direction, descriptions)
+        persona = await generate_persona(ai_client, name, direction, squad_direction, descriptions, model=args.model)
         if not persona:
             print("Failed to generate persona. Aborting before writing any new bot config.")
             return []
@@ -331,14 +319,16 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Add one or more Twitch bot accounts.")
     parser.add_argument("--count", type=int, default=None, help="Number of bots to add")
     parser.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI, help="Twitch OAuth redirect URI")
+    parser.add_argument("--timeout", type=int, default=180, help="OAuth timeout per bot in seconds")
     parser.add_argument("--env-path", default=".env", help="Env file to update")
+    parser.add_argument("--model", default="gpt-4o-mini", help="OpenAI model for persona generation")
     args = parser.parse_args()
 
     if not OPENAI_API_KEY:
         print("Error: OPENAI_API_KEY is not set.")
         return
-    if not TWITCH_CLIENT_ID:
-        print("Error: TWITCH_CLIENT_ID is not set.")
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        print("Error: TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET must be set.")
         return
     if args.count is not None and args.count <= 0:
         print("Error: --count must be greater than 0.")

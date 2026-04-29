@@ -29,6 +29,16 @@ Required runtime values:
 
 TwitchIO tokens must use `oauth:` prefix.
 
+## Guided Quickstart
+
+Run this for first setup:
+
+```powershell
+python quickstart.py
+```
+
+It asks for Twitch, OpenAI, optional Azure or HTTP transcript settings, then lets you add bot accounts one by one. Each bot login uses the same OAuth callback flow as `generate_twitch_bot_tokens.py`, and tokens are written to `.env` without being printed.
+
 ## Generate Twitch Bot Tokens
 
 Register redirect URI in Twitch app settings, then run:

@@ -16,15 +16,13 @@ Create your local env file:
 Copy-Item .env.example .env
 ```
 
-Fill `.env` with your Twitch, OpenAI, and bot token values. Do not commit `.env`.
-
-Generate Twitch bot tokens:
+Run the guided setup:
 
 ```powershell
-python generate_twitch_bot_tokens.py --redirect-uri http://localhost:3000/callback --write-env
+python quickstart.py
 ```
 
-Add multiple bot accounts with AI-generated roles:
+Or add more bot accounts later:
 
 ```powershell
 python add_bot_assistant.py --count 3
