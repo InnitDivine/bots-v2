@@ -75,21 +75,21 @@ TWITCH_CLIENT_SECRET = _env("TWITCH_CLIENT_SECRET")
 BOTS = [
     {
         "name": "sienna",
-        "username": _env("TWITCH_BOT_USERNAME_SIENNA", "siennadabanana"),
+        "username": _env("TWITCH_BOT_USERNAME_SIENNA", "example_chillbot"),
         "token": _env("TWITCH_BOT_TOKEN_SIENNA"),
         "message_frequency": (35, 80),
         "is_moderator": False,
     },
     {
         "name": "knight",
-        "username": _env("TWITCH_BOT_USERNAME_KNIGHT", "divinesknight"),
+        "username": _env("TWITCH_BOT_USERNAME_KNIGHT", "example_modbot"),
         "token": _env("TWITCH_BOT_TOKEN_KNIGHT"),
         "message_frequency": (40, 90),
         "is_moderator": True,
     },
     {
         "name": "simp",
-        "username": _env("TWITCH_BOT_USERNAME_SIMP", "xsmallstreamersimpx"),
+        "username": _env("TWITCH_BOT_USERNAME_SIMP", "example_hypebot"),
         "token": _env("TWITCH_BOT_TOKEN_SIMP"),
         "message_frequency": (30, 70),
         "is_moderator": False,
