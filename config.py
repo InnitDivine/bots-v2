@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 TOKEN_PREFIX = "oauth:"
 _TOKEN_BODY_RE = re.compile(r"^[^\s:]+$")
+_TOKEN_PLACEHOLDERS = {"...", "changeme", "change_me", "replace_me", "token", "your_token"}
 
 
 def _truthy(raw: str | None) -> bool:
@@ -53,7 +54,7 @@ def normalize_twitch_token(raw: str) -> str:
         body = token[len(TOKEN_PREFIX) :].strip()
     else:
         body = token
-    if not body or not _TOKEN_BODY_RE.fullmatch(body):
+    if not body or body.lower() in _TOKEN_PLACEHOLDERS or not _TOKEN_BODY_RE.fullmatch(body):
         raise ValueError("Malformed Twitch token")
     return f"{TOKEN_PREFIX}{body}"
 
