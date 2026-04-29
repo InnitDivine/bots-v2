@@ -17,6 +17,8 @@ def _spawn_runner(cwd: str, name: str, args) -> subprocess.Popen:
 
     if args.smoketest:
         cmd.append("--smoketest")
+    if args.send_smoketest_message:
+        cmd.append("--send-smoketest-message")
 
     if args.no_mic:
         cmd.append("--no-mic")
@@ -40,6 +42,7 @@ def main():
     ap.add_argument("--bots", default=",".join(_valid_names()))
     ap.add_argument("--primary", default="sienna", help="Primary bot handles mic/helix unless disabled")
     ap.add_argument("--smoketest", action="store_true")
+    ap.add_argument("--send-smoketest-message", action="store_true")
     ap.add_argument("--no-mic", action="store_true")
     ap.add_argument("--no-helix", action="store_true")
     ap.add_argument("--inject-stdin", action="store_true")

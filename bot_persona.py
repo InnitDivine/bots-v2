@@ -123,7 +123,7 @@ class Bot(commands.Bot):
         self._last_seen_mic_id = ""
         self._lurk_until = 0.0
         self._chat_task: Optional[asyncio.Task] = None
-        self._closing = False
+        self._local_closing = False
         self._sent_window: deque[float] = deque(maxlen=MAX_MSG_PER_MINUTE * 2)
         self._recent_local_lines: deque[str] = deque(maxlen=RECENT_LOCAL_LINES)
         self._recent_chat: deque[tuple[str, str, float]] = deque(maxlen=RECENT_CHAT_CONTEXT)
@@ -161,17 +161,18 @@ class Bot(commands.Bot):
         self._chat_task = None
 
     async def close(self):
-        if self._closing:
+        if self._local_closing:
             return
-        self._closing = True
+        self._local_closing = True
         try:
             if self._chat_task and not self._chat_task.done():
                 self._chat_task.cancel()
                 await asyncio.gather(self._chat_task, return_exceptions=True)
             self._chat_task = None
-            await super().close()
+            if getattr(getattr(self, "_closing", None), "set", None) is not None:
+                await super().close()
         finally:
-            self._closing = False
+            self._local_closing = False
 
     def _adaptive_cooldown(self) -> float:
         base = float(BASE_MIN_COOLDOWN_SECS)
