@@ -39,6 +39,16 @@ python generate_twitch_bot_tokens.py --redirect-uri http://localhost:3000/callba
 
 The helper validates OAuth state, writes `oauth:`-prefixed tokens, and does not print token values.
 
+## Add Bot Accounts
+
+To add several bots and let AI generate a short role/persona for each one:
+
+```powershell
+python add_bot_assistant.py --count 3
+```
+
+The assistant opens a Twitch login for each bot account, writes tokens to `.env`, adds each bot to `config.py`, and adds each AI-generated role to `bot_persona.py`.
+
 ## Smoke Test
 
 Safe default:

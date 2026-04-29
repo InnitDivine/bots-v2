@@ -1,25 +1,36 @@
 """
-Assist with adding a Twitch bot account.
+Assist with adding one or more Twitch bot accounts.
 
 Secrets are written only to .env. Tokens are never printed.
 """
 
+import argparse
 import ast
 import asyncio
 import json
 import re
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from openai import AsyncOpenAI
 
-from bot_persona import PERSONA_STYLE
-from config import BOTS, OPENAI_API_KEY, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, normalize_twitch_token
+from config import BOTS, OPENAI_API_KEY, TWITCH_CLIENT_ID, normalize_twitch_token
 
 USERNAME_RE = re.compile(r"^[a-z0-9_]{4,25}$")
 DEFAULT_MESSAGE_FREQUENCY = (45, 95)
+DEFAULT_REDIRECT_URI = "http://localhost:3000/callback"
+
+
+@dataclass
+class BotDraft:
+    name: str
+    token: str
+    persona: dict[str, Any]
+    is_moderator: bool
+    message_frequency: tuple[int, int] = DEFAULT_MESSAGE_FREQUENCY
 
 
 def validate_bot_username(username: str, existing_names: set[str] | None = None) -> str:
@@ -35,6 +46,7 @@ def validate_persona(persona: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(persona, dict):
         raise ValueError("Persona must be a JSON object.")
 
+    description = str(persona.get("description") or "").strip()
     tone = str(persona.get("tone") or "").strip()
     phrasing = str(persona.get("phrasing") or "").strip()
     try:
@@ -42,6 +54,8 @@ def validate_persona(persona: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError) as exc:
         raise ValueError("Persona llm_temp must be a number.") from exc
 
+    if not description:
+        raise ValueError("Persona description is required.")
     if not tone:
         raise ValueError("Persona tone is required.")
     if not phrasing:
@@ -49,7 +63,12 @@ def validate_persona(persona: dict[str, Any]) -> dict[str, Any]:
     if not 0.6 <= llm_temp <= 1.0:
         raise ValueError("Persona llm_temp must be between 0.6 and 1.0.")
 
-    return {"tone": tone, "phrasing": phrasing, "llm_temp": llm_temp}
+    return {
+        "description": description,
+        "tone": tone,
+        "phrasing": phrasing,
+        "llm_temp": llm_temp,
+    }
 
 
 def validate_persona_json(raw: str) -> dict[str, Any]:
@@ -80,21 +99,52 @@ def _insert_before_assignment_end(path: Path, assignment_name: str, entry_lines:
     path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
 
 
+def _prompt_bool(label: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    raw = input(f"{label} ({suffix}): ").strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes", "true", "1"}
+
+
+def _prompt_usernames(count: int | None = None) -> list[str]:
+    if count is not None:
+        names: list[str] = []
+        for i in range(1, count + 1):
+            names.append(input(f"Bot {i} Twitch username: ").strip())
+        return names
+
+    raw = input("Enter bot Twitch usernames, comma-separated: ").strip()
+    if raw:
+        return [name.strip() for name in raw.split(",") if name.strip()]
+
+    names = []
+    print("Enter one bot username per line. Leave blank when done.")
+    while True:
+        name = input(f"Bot {len(names) + 1} Twitch username: ").strip()
+        if not name:
+            break
+        names.append(name)
+    return names
+
+
 async def get_bot_token(bot_username: str, redirect_uri: str, client_id: str) -> Optional[str]:
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "token",
         "scope": "chat:read chat:edit",
+        "force_verify": "true",
+        "login": bot_username,
     }
     auth_url = f"https://id.twitch.tv/oauth2/authorize?{urlencode(params)}"
 
     print("\n" + "=" * 50)
-    print("Twitch Authentication")
+    print(f"Twitch Authentication: {bot_username}")
     print("=" * 50)
-    print("1. A browser window will open for Twitch authorization.")
-    print(f"2. Log in as bot account: '{bot_username}'")
-    print("3. After approval, copy the full redirected URL.")
+    print("A browser window will open for Twitch authorization.")
+    print(f"Log in as bot account: {bot_username}")
+    print("After approval, copy the full redirected URL.")
 
     webbrowser.open(auth_url)
     redirect_url = input("Paste the full redirect URL here: ").strip()
@@ -111,28 +161,43 @@ async def get_bot_token(bot_username: str, redirect_uri: str, client_id: str) ->
         return None
 
 
-async def generate_persona(ai_client: AsyncOpenAI, bot_name: str, description: str) -> Optional[dict[str, Any]]:
+async def generate_persona(
+    ai_client: AsyncOpenAI,
+    bot_name: str,
+    direction: str,
+    squad_direction: str,
+    existing_descriptions: list[str],
+) -> Optional[dict[str, Any]]:
+    direction_text = direction or "No specific direction. Choose a useful distinct role for this bot."
+    existing_text = "\n".join(f"- {line}" for line in existing_descriptions) or "none yet"
     prompt = f"""
-You are a configuration assistant for a Twitch bot system.
-Generate a JSON object for bot '{bot_name}' from this description:
-{description}
+You are configuring a Twitch multi-bot chat squad.
 
-Required keys:
+Bot username: {bot_name}
+Overall squad/channel direction: {squad_direction or "friendly, varied Twitch chat support"}
+User direction for this bot: {direction_text}
+Existing bot roles:
+{existing_text}
+
+Generate one concise JSON object:
+- "description": one short sentence describing what this bot will be in chat
 - "tone": short attitude string
 - "phrasing": short speaking style string
 - "llm_temp": float from 0.6 to 1.0
+
+Keep it distinct from existing bot roles. Keep it safe, natural, and Twitch-chat-sized.
 """
 
-    print("\nGenerating AI persona...")
+    print(f"\nGenerating AI persona for {bot_name}...")
     try:
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Return only valid JSON for a Twitch bot persona."},
+                {"role": "system", "content": "Return only valid JSON for a safe Twitch bot persona."},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
-            temperature=0.5,
+            temperature=0.6,
         )
         persona_str = response.choices[0].message.content
         if not persona_str:
@@ -180,7 +245,7 @@ def update_config_py(
         "    },",
     ]
     _insert_before_assignment_end(Path(config_path), "BOTS", entry)
-    print("Updated config.py with the new bot.")
+    print(f"Updated config.py with {name}.")
 
 
 def update_bot_persona_py(
@@ -192,59 +257,114 @@ def update_bot_persona_py(
     safe = validate_persona(persona)
     entry = [
         f"    {json.dumps(name)}: {{",
+        f'        "description": {json.dumps(safe["description"])},',
         f'        "tone": {json.dumps(safe["tone"])},',
         f'        "phrasing": {json.dumps(safe["phrasing"])},',
         f'        "llm_temp": {safe["llm_temp"]:.3g},',
         "    },",
     ]
     _insert_before_assignment_end(Path(persona_path), "PERSONA_STYLE", entry)
-    print("Updated bot_persona.py with the new persona.")
+    print(f"Updated bot_persona.py with {name}.")
+
+
+def apply_bot_draft(draft: BotDraft, env_path: Path | str = ".env") -> None:
+    update_env_file(draft.name, draft.token, env_path=env_path)
+    update_config_py(draft.name, draft.is_moderator, draft.message_frequency)
+    update_bot_persona_py(draft.name, draft.persona)
+
+
+async def collect_bot_drafts(args: argparse.Namespace) -> list[BotDraft]:
+    existing = {str(b.get("name", "")).strip().lower() for b in BOTS}
+    raw_names = _prompt_usernames(args.count)
+    if not raw_names:
+        print("No bot usernames entered.")
+        return []
+
+    names: list[str] = []
+    for raw_name in raw_names:
+        try:
+            name = validate_bot_username(raw_name, existing_names=existing | set(names))
+        except ValueError as exc:
+            print(f"Invalid bot username '{raw_name}': {exc}")
+            return []
+        names.append(name)
+
+    squad_direction = input("Overall vibe for this bot squad (optional): ").strip()
+    ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    drafts: list[BotDraft] = []
+    descriptions: list[str] = []
+
+    for index, name in enumerate(names, start=1):
+        print("\n" + "-" * 50)
+        print(f"Setting up bot {index}/{len(names)}: {name}")
+
+        token = await get_bot_token(name, args.redirect_uri, TWITCH_CLIENT_ID)
+        if not token:
+            print("Failed to get token. Aborting before writing any new bot config.")
+            return []
+
+        direction = input("Describe what this bot should be like, or press Enter for AI to choose: ").strip()
+        persona = await generate_persona(ai_client, name, direction, squad_direction, descriptions)
+        if not persona:
+            print("Failed to generate persona. Aborting before writing any new bot config.")
+            return []
+
+        print("\nGenerated role:")
+        print(f"- {persona['description']}")
+        print(f"- tone: {persona['tone']}")
+        print(f"- phrasing: {persona['phrasing']}")
+        print(f"- llm_temp: {persona['llm_temp']}")
+
+        if not _prompt_bool("Use this persona", default=True):
+            print("Aborting before writing any new bot config.")
+            return []
+
+        is_moderator = _prompt_bool("Is this bot a moderator", default=False)
+        draft = BotDraft(name=name, token=token, persona=persona, is_moderator=is_moderator)
+        drafts.append(draft)
+        descriptions.append(f"{name}: {persona['description']}")
+
+    return drafts
 
 
 async def main() -> None:
+    parser = argparse.ArgumentParser(description="Add one or more Twitch bot accounts.")
+    parser.add_argument("--count", type=int, default=None, help="Number of bots to add")
+    parser.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI, help="Twitch OAuth redirect URI")
+    parser.add_argument("--env-path", default=".env", help="Env file to update")
+    args = parser.parse_args()
+
     if not OPENAI_API_KEY:
         print("Error: OPENAI_API_KEY is not set.")
         return
-    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
-        print("Error: TWITCH_CLIENT_ID or TWITCH_CLIENT_SECRET is not set.")
+    if not TWITCH_CLIENT_ID:
+        print("Error: TWITCH_CLIENT_ID is not set.")
+        return
+    if args.count is not None and args.count <= 0:
+        print("Error: --count must be greater than 0.")
         return
 
-    print("--- New Bot Assistant ---")
-    existing = {str(b.get("name", "")).strip().lower() for b in BOTS}
-    bot_name_raw = input("Enter the new bot's Twitch username: ")
-    try:
-        bot_name = validate_bot_username(bot_name_raw, existing_names=existing)
-    except ValueError as exc:
-        print(f"Invalid bot username: {exc}")
+    print("--- Multi-Bot Assistant ---")
+    print("Tokens will be written to .env and will not be printed.")
+    drafts = await collect_bot_drafts(args)
+    if not drafts:
         return
 
-    token = await get_bot_token(bot_name, "http://localhost:3000", TWITCH_CLIENT_ID)
-    if not token:
-        print("Failed to get token. Aborting.")
+    print("\nReady to write these bots:")
+    for draft in drafts:
+        mod = "moderator" if draft.is_moderator else "chatter"
+        print(f"- {draft.name}: {draft.persona['description']} ({mod})")
+
+    if not _prompt_bool("Write .env, config.py, and bot_persona.py now", default=True):
+        print("No files changed.")
         return
 
-    description = input("Enter a brief description of the bot's personality: ")
-    ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-    persona = await generate_persona(ai_client, bot_name, description)
-    if not persona:
-        print("Failed to generate persona. Aborting.")
-        return
-
-    print("\n--- Generated Persona ---")
-    print(json.dumps(persona, indent=2))
-    print("--------------------------")
-
-    is_mod_str = input("Is this bot a moderator? (y/n): ").lower().strip()
-    is_moderator = is_mod_str == "y"
-
-    print("\nUpdating configuration files...")
-    update_env_file(bot_name, token)
-    update_config_py(bot_name, is_moderator, DEFAULT_MESSAGE_FREQUENCY)
-    update_bot_persona_py(bot_name, persona)
+    for draft in drafts:
+        apply_bot_draft(draft, env_path=args.env_path)
 
     print("\n" + "=" * 50)
-    print("Bot setup complete.")
-    print(f"'{bot_name}' has been added. Run `python launch_multi.py` to include it.")
+    print(f"Bot setup complete. Added {len(drafts)} bot(s).")
+    print("Run `python launch_multi.py` to include them.")
     print("=" * 50)
 
 

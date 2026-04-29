@@ -311,6 +311,7 @@ class Bot(commands.Bot):
         banned = ", ".join(bank.get("ban_terms", []))
 
         style = PERSONA_STYLE.get(self.p.name, PERSONA_STYLE["knight"])
+        role = str(style.get("description") or "").strip()
         tone = style["tone"]
         phrasing = style["phrasing"]
         base_temp = float(style["llm_temp"])
@@ -343,6 +344,7 @@ class Bot(commands.Bot):
         prompt = (
             f"broadcaster words: '{quoted}'\n"
             f"game: {g}\n"
+            f"bot role: {role or 'natural Twitch chatter'}\n"
             f"gamebank hints: {self._gamebank_hint()}\n"
             f"recent broadcaster context: {self._mic_hint()}\n"
             f"recent real chat context: {self._chat_hint()}\n"
@@ -382,8 +384,10 @@ class Bot(commands.Bot):
             topic_hint = f" Touch: {self.rng.choice(bank['topics'])}."
 
         style = PERSONA_STYLE.get(self.p.name, PERSONA_STYLE["knight"])
+        role = str(style.get("description") or "").strip()
         prompt = (
             f"Quiet stream moment in {g}. Write one short Twitch line (3-10 words). "
+            f"Bot role: {role or 'natural Twitch chatter'}. "
             f"Tone: {style['tone']}. Style: {style['phrasing']}. "
             f"Address Divine/Innit/innitdivine, never streamer. "
             f"Use Twitch global emote names only, no Unicode emoji. "

@@ -24,6 +24,12 @@ Generate Twitch bot tokens:
 python generate_twitch_bot_tokens.py --redirect-uri http://localhost:3000/callback --write-env
 ```
 
+Add multiple bot accounts with AI-generated roles:
+
+```powershell
+python add_bot_assistant.py --count 3
+```
+
 ## Run
 
 Safe connect-only check:
