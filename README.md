@@ -1,6 +1,6 @@
 # bots-v2
 
-Safe, testable multi-account Twitch chat bot system.
+Safe multi-account Twitch chat bot system.
 
 This project runs multiple TwitchIO bot accounts against one Twitch channel. It can use OpenAI for chat generation, Twitch Helix for stream context, Azure Speech or HTTP transcript polling for broadcaster context, and locked shared JSON files for coordination between bot processes.
 
@@ -12,7 +12,6 @@ This project runs multiple TwitchIO bot accounts against one Twitch channel. It 
 - Shared transcript, metadata, and recent-message coordination.
 - Per-bot cooldowns plus global cross-bot throttle.
 - Secret-safe defaults for smoketests, logs, caches, and runtime files.
-- Pytest coverage for config safety, OAuth helpers, runner restart behavior, shared JSON safety, and chat sanitation.
 
 ## Safety Notes
 
@@ -48,7 +47,6 @@ Run safe checks:
 
 ```powershell
 python -m compileall -q .
-python -m pytest -q
 ```
 
 Run a safe connect-only smoketest:
@@ -120,9 +118,6 @@ Azure Speech is optional at runtime if you use HTTP transcript polling instead o
 - `openai`: OpenAI API client for generated chat/persona text.
 - `azure-cognitiveservices-speech`: optional Azure speech-to-text support.
 - `python-dotenv`: loads local `.env` configuration.
-- `pytest`: test runner.
-- `pytest-asyncio`: async test support for runner/OAuth behavior.
-
 Install all of them with:
 
 ```powershell
@@ -197,11 +192,10 @@ Install/update dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Run tests:
+Check Python syntax:
 
 ```powershell
 python -m compileall -q .
-python -m pytest -q
 ```
 
 Safe smoketest without sending chat:

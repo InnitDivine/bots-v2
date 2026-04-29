@@ -4,7 +4,6 @@
 
 - Keep secrets in `.env` only. Commit/share `.env.example`, not `.env`.
 - Runtime files under `run/`, logs, heartbeats, caches, and shared JSON state are ignored.
-- Tests do not require live Twitch, OpenAI, or Azure calls.
 - Smoketest connects only; it does not send chat unless `--send-smoketest-message` is passed.
 
 ## Setup
@@ -83,9 +82,8 @@ python launch_multi.py --inject-stdin
 
 Type lines into primary window at `inject>` prompt.
 
-## Tests
+## Syntax Check
 
 ```powershell
 python -m compileall -q .
-python -m pytest -q
 ```
