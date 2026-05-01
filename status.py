@@ -27,6 +27,13 @@ def _read_json(path: str) -> Any:
         return None
 
 
+def _mask_url(url: str) -> str:
+    if not url:
+        return ""
+    base, sep, _ = url.partition("?")
+    return f"{base}?<masked>" if sep else base
+
+
 def _age(path: Path) -> str:
     try:
         return f"{time.time() - path.stat().st_mtime:.0f}s ago"
@@ -62,7 +69,7 @@ def main() -> None:
     for err in errors:
         print(f" - {err}")
 
-    transcript_source = "azure" if AZURE_SPEECH_KEY else f"http endpoint {TRANSCRIPT_HTTP_ENDPOINT}"
+    transcript_source = "azure" if AZURE_SPEECH_KEY else f"http endpoint {_mask_url(TRANSCRIPT_HTTP_ENDPOINT)}"
     print(f"transcript source: {transcript_source}")
     print(f"transcript file: {SHARED_TRANSCRIPT_FILE}")
     print(f"transcript state: {'present' if isinstance(transcript, dict) else 'missing'}")

@@ -57,21 +57,17 @@ def normalize_twitch_token(raw: str) -> str:
         return ""
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
-    if token.lower().startswith(TOKEN_PREFIX):
-        body = token[len(TOKEN_PREFIX) :].strip()
-    else:
-        body = token
+    if not token.lower().startswith(TOKEN_PREFIX):
+        raise ValueError("Twitch token missing oauth: prefix")
+    body = token[len(TOKEN_PREFIX) :].strip()
     if not body or body.lower() in _TOKEN_PLACEHOLDERS or not _TOKEN_BODY_RE.fullmatch(body):
         raise ValueError("Malformed Twitch token")
     return f"{TOKEN_PREFIX}{body}"
 
 
 def is_valid_twitch_token(raw: str) -> bool:
-    token = (raw or "").strip()
-    if not token.lower().startswith(TOKEN_PREFIX):
-        return False
     try:
-        return bool(normalize_twitch_token(token))
+        return bool(normalize_twitch_token(raw))
     except ValueError:
         return False
 
