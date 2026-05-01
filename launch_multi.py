@@ -19,7 +19,14 @@ def main():
     parser.add_argument("--no-helix", action="store_true")
     parser.add_argument("--inject-stdin", action="store_true")
     parser.add_argument("--use-watchdog", action="store_true", help="Launch watchdog supervisor instead of direct windows")
+    parser.add_argument("--status", action="store_true", help="Print safe local DivBots status and exit")
     args = parser.parse_args()
+
+    if args.status:
+        from status import main as status_main
+
+        status_main()
+        return
 
     if args.bots:
         selected = [x.strip().lower() for x in args.bots.split(",") if x.strip()]

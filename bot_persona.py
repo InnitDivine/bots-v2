@@ -14,6 +14,10 @@ from twitchio.ext import commands
 from config import (
     BASE_MIN_COOLDOWN_SECS,
     BROADCASTER_ALIASES,
+    DEFAULT_MESSAGE_MODES,
+    DIVBOTS_ALLOW_BOT_TO_BOT,
+    DIVBOTS_ASCII_ONLY,
+    DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN,
     FALLBACK_QUESTIONS,
     GLOBAL_MAX_MSG_PER_MINUTE,
     GLOBAL_MIN_COOLDOWN_SECS,
@@ -26,6 +30,9 @@ from config import (
     TARGET_CHANNEL,
     TYPING_PATTERNS,
 )
+from divbot_commands import apply_divbots_command
+from divbot_memory import DivBotMemory
+from divbot_policy import BotPolicyState, PolicyConfig, decide_send, mark_send, sanitize_message
 from gamebank import GameBankManager
 from shared import SharedState
 
@@ -119,12 +126,14 @@ class Persona:
         token: str,
         message_frequency: tuple[int, int],
         is_moderator: bool = False,
+        settings: Optional[dict] = None,
     ):
         self.name = name
         self.username = username
         self.token = token
         self.message_frequency = message_frequency
         self.is_moderator = bool(is_moderator)
+        self.settings = settings or {}
 
 
 class Bot(commands.Bot):
@@ -134,6 +143,9 @@ class Bot(commands.Bot):
         self.ai = ai
         self.shared = shared
         self.gb = gb
+        self.memory = DivBotMemory()
+        self.policy_config = PolicyConfig.from_env()
+        self.policy_state = BotPolicyState()
 
         self.rng = random.Random(f"{self.p.name}-{os.getpid()}")
         self._last_sent_at = 0.0
@@ -146,6 +158,21 @@ class Bot(commands.Bot):
         self._recent_chat: deque[tuple[str, str, float]] = deque(maxlen=RECENT_CHAT_CONTEXT)
         self._recent_mic_lines: deque[str] = deque(maxlen=RECENT_MIC_LINES)
         self._bot_usernames = {b["username"].strip().lower() for b in BOTS if b.get("username")}
+
+    def _setting(self, name: str, default):
+        return self.p.settings.get(name, default)
+
+    def _mode_allowed(self, mode: str) -> bool:
+        if mode in {"idle_question", "game_question"} and not self._setting("can_prompt_streamer", True):
+            return False
+        if mode in {"streamer_followup", "hype_reaction", "fail_reaction"} and not self._setting(
+            "can_react_to_transcript", True
+        ):
+            return False
+        if mode == "chat_reply" and not self._setting("can_react_to_chat", True):
+            return False
+        modes = self._setting("message_modes", DEFAULT_MESSAGE_MODES)
+        return mode in modes
 
     async def event_ready(self):
         print(f"{self.p.name} connected as {self.nick}")
@@ -164,12 +191,37 @@ class Bot(commands.Bot):
             if not author or not text:
                 return
 
-            # Ignore our bot trio for context; keep real chatter and broadcaster lines.
-            if author.lower() in self._bot_usernames:
+            if text.lower().startswith("!divbots"):
+                if BOTS and self.p.name != BOTS[0]["name"]:
+                    return
+                if self._command_authorized(message, author):
+                    result = apply_divbots_command(text, self.shared, self.memory)
+                    if result.handled and result.response:
+                        ch = getattr(message, "channel", None)
+                        if ch is not None:
+                            await ch.send(result.response)
                 return
+
+            # Ignore our bot trio for context; keep real chatter and broadcaster lines.
+            if author.lower() in self._bot_usernames and not DIVBOTS_ALLOW_BOT_TO_BOT:
+                return
+            self.shared.mark_real_chat()
             self._recent_chat.append((author, text, time.time()))
         except Exception:
             return
+
+    def _command_authorized(self, message, author: str) -> bool:
+        if author.strip().lower() == TARGET_CHANNEL.lower():
+            return True
+        author_obj = getattr(message, "author", None)
+        for attr in ("is_mod", "mod", "is_broadcaster", "broadcaster"):
+            if bool(getattr(author_obj, attr, False)):
+                return True
+        tags = getattr(message, "tags", {}) or {}
+        if isinstance(tags, dict):
+            badges = str(tags.get("badges") or tags.get("badge-info") or "").lower()
+            return "moderator" in badges or "broadcaster" in badges
+        return False
 
     async def event_disconnect(self):
         if self._chat_task and not self._chat_task.done():
@@ -192,7 +244,7 @@ class Bot(commands.Bot):
             self._local_closing = False
 
     def _adaptive_cooldown(self) -> float:
-        base = float(BASE_MIN_COOLDOWN_SECS)
+        base = float(BASE_MIN_COOLDOWN_SECS) * float(self._setting("cooldown_multiplier", 1.0))
         if self.shared.hype > 7:
             return max(8.0, base - 2.0)
         if self.shared.silence > 30:
@@ -211,9 +263,24 @@ class Bot(commands.Bot):
     def _can_send_now(self) -> bool:
         return self._cooldown_ok() and self._rate_limit_ok()
 
+    def _policy_ok(self, mode: str, message: str = "") -> bool:
+        if self.shared.is_quiet() or not self._mode_allowed(mode):
+            return False
+        decision = decide_send(
+            self.policy_config,
+            self.policy_state,
+            mode=mode,
+            bot_cooldown_s=self._adaptive_cooldown(),
+            per_bot_max_per_minute=MAX_MSG_PER_MINUTE,
+            last_real_chat_at=self.shared.last_real_chat_at,
+            is_duplicate=bool(message and (self._is_local_duplicate(message) or self.shared.is_global_duplicate(message))),
+        )
+        return decision.allowed
+
     def _mark_sent(self):
         self._last_sent_at = time.time()
         self._sent_window.append(self._last_sent_at)
+        mark_send(self.policy_state, getattr(self, "_last_send_mode", "idle_question"), self._last_sent_at)
 
     def _lurk_active(self) -> bool:
         return time.time() < self._lurk_until
@@ -227,8 +294,12 @@ class Bot(commands.Bot):
             self._lurk_until = time.time() + dur
 
     def _emote_only(self) -> str:
+        if not self._setting("can_use_emotes", True):
+            return self._stock("casual")
         pool = self.shared.global_emotes or ["Kappa", "LUL", "PogChamp", "4Head", "TriHard", "SeemsGood"]
-        return self.rng.choice(pool)
+        style = self._setting("emote_style", "balanced")
+        count = 2 if style == "heavy" and len(pool) > 1 and self.rng.random() < 0.35 else 1
+        return " ".join(self.rng.choice(pool) for _ in range(count))
 
     def _stock(self, ctx: str) -> str:
         if ctx == "hype":
@@ -274,9 +345,14 @@ class Bot(commands.Bot):
         if not msg:
             return None
         msg = _swap_streamer_alias(self.rng, msg)
-        msg = msg.encode("ascii", "ignore").decode("ascii")
-        msg = re.sub(r"\s+", " ", msg).strip()
+        msg = sanitize_message(
+            msg,
+            max_words=int(self._setting("max_words", MAX_WORDS)),
+            ascii_only=DIVBOTS_ASCII_ONLY,
+        )
         if not msg:
+            return None
+        if self.memory.is_blocked(msg):
             return None
 
         bank = self.gb.get(self.shared.game)
@@ -284,10 +360,6 @@ class Bot(commands.Bot):
             for t in bank.get("ban_terms", []):
                 if t.lower() in msg.lower():
                     return None
-
-        words = msg.split()
-        if len(words) > MAX_WORDS:
-            msg = " ".join(words[:MAX_WORDS])
         return msg
 
     def _recent_hint(self) -> str:
@@ -296,6 +368,8 @@ class Bot(commands.Bot):
         return " | ".join(list(self._recent_local_lines)[-RECENT_HINT_WINDOW:])
 
     def _chat_hint(self) -> str:
+        if not self._setting("can_react_to_chat", True):
+            return "none"
         if not self._recent_chat:
             return "none"
         rows = []
@@ -325,10 +399,32 @@ class Bot(commands.Bot):
             return False
         return any(_norm_message(row) == norm for row in self._recent_local_lines)
 
-    async def _ai(self, source_text: str, help_mode: bool) -> Optional[str]:
+    def _instruction_for_mode(self, mode: str, tone: str, phrasing: str, help_mode: bool) -> str:
+        if mode == "hype_reaction":
+            lead = "Write one excited Twitch reaction. 1-6 words."
+        elif mode == "fail_reaction":
+            lead = "Write one kind fail reaction. 1-6 words. No dunking."
+        elif mode == "game_question":
+            lead = "Write one short game question. 3-10 words."
+        elif mode == "idle_question":
+            lead = "Write one dead-chat prompt. 3-10 words."
+        elif mode == "chat_reply":
+            lead = "Write one brief chat-support reply. 3-10 words."
+        elif help_mode:
+            lead = "Write one supportive Twitch chat line. 3-10 words."
+        else:
+            lead = "Write one short Twitch reaction. 2-6 words."
+        return (
+            f"{lead} Tone: {tone}. Style: {phrasing}. "
+            f"Address broadcaster as {_alias_text()}. "
+            "Never say streamer. Never mention AI. Use Twitch global emote names only. No Unicode emoji."
+        )
+
+    async def _ai(self, source_text: str, help_mode: bool, mode: str) -> Optional[str]:
         g = self.shared.game or "the game"
         bank = self.gb.get(self.shared.game) or {"ban_terms": []}
         banned = ", ".join(bank.get("ban_terms", []))
+        blocked = self.memory.avoid_text()
 
         style = _persona_style(self.p.name)
         role = str(style.get("description") or "").strip()
@@ -336,36 +432,28 @@ class Bot(commands.Bot):
         phrasing = style["phrasing"]
         base_temp = float(style["llm_temp"])
 
-        if help_mode:
-            instruction = (
-                f"Write one supportive Twitch chat line. 3-10 words. Tone: {tone}. "
-                f"Style: {phrasing}. Address broadcaster as {_alias_text()}. "
-                "Never say streamer. Use Twitch global emote names only. No Unicode emoji."
-            )
-            temp = max(0.65, base_temp - 0.08)
-            quoted = source_text[-180:]
-        else:
-            instruction = (
-                f"Write one short Twitch reaction. 2-6 words. Tone: {tone}. "
-                f"Style: {phrasing}. Address broadcaster as {_alias_text()}. "
-                "Never say streamer. Use Twitch global emote names only. No Unicode emoji."
-            )
-            temp = base_temp
-            quoted = source_text[-140:]
+        instruction = self._instruction_for_mode(mode, tone, phrasing, help_mode)
+        temp = max(0.65, base_temp - 0.08) if help_mode or mode in {"game_question", "chat_reply"} else base_temp
+        quoted = source_text[-180:] if help_mode else source_text[-140:]
 
         if self.p.is_moderator:
             instruction += (
                 " You are a moderator in this channel, so keep lines constructive and de-escalating."
             )
+        if self.shared.manual_topic:
+            instruction += f" Current streamer-approved topic: {self.shared.manual_topic}."
 
         prompt = (
+            f"mode: {mode}\n"
             f"broadcaster words: '{quoted}'\n"
             f"game: {g}\n"
             f"bot role: {role or 'natural Twitch chatter'}\n"
+            f"bot purpose: {self._setting('purpose', '')}\n"
             f"gamebank hints: {self._gamebank_hint()}\n"
             f"recent broadcaster context: {self._mic_hint()}\n"
             f"recent real chat context: {self._chat_hint()}\n"
             f"avoid terms: {banned}\n"
+            f"blocked memory: {blocked}\n"
             f"recent lines to avoid repeating: {self._recent_hint()}\n"
             "Grounding rule: do not invent specifics. If unsure, ask a short clarifying question.\n"
             f"{instruction}"
@@ -392,10 +480,11 @@ class Bot(commands.Bot):
         except Exception:
             return None
 
-    async def _ai_background(self) -> Optional[str]:
+    async def _ai_background(self, mode: str = "idle_question") -> Optional[str]:
         g = self.shared.game or "the game"
         bank = self.gb.get(self.shared.game) or {}
         banned = ", ".join(bank.get("ban_terms") or [])
+        blocked = self.memory.avoid_text()
         topic_hint = ""
         if bank.get("topics"):
             topic_hint = f" Touch: {self.rng.choice(bank['topics'])}."
@@ -403,12 +492,15 @@ class Bot(commands.Bot):
         style = _persona_style(self.p.name)
         role = str(style.get("description") or "").strip()
         prompt = (
+            f"Mode: {mode}. "
             f"Quiet stream moment in {g}. Write one short Twitch line (3-10 words). "
             f"Bot role: {role or 'natural Twitch chatter'}. "
+            f"Bot purpose: {self._setting('purpose', '')}. "
             f"Tone: {style['tone']}. Style: {style['phrasing']}. "
             f"Address {_alias_text()}, never streamer. "
-            f"Use Twitch global emote names only, no Unicode emoji. "
+            f"Use Twitch global emote names only, no Unicode emoji. Never mention AI. "
             f"Avoid: {banned}.{topic_hint} "
+            f"Blocked memory: {blocked}. "
             f"Avoid repeating: {self._recent_hint()}. "
             f"Recent real chat context: {self._chat_hint()}. "
             f"Recent broadcaster context: {self._mic_hint()}. "
@@ -497,6 +589,16 @@ class Bot(commands.Bot):
                     ctx = "question"
                 else:
                     ctx = "general"
+                if ctx == "hype":
+                    mode = "hype_reaction"
+                elif ctx == "fail":
+                    mode = "fail_reaction"
+                elif help_mode:
+                    mode = "streamer_followup"
+                elif ctx == "question":
+                    mode = "game_question"
+                else:
+                    mode = "idle_question"
 
                 message: Optional[str] = None
 
@@ -504,6 +606,7 @@ class Bot(commands.Bot):
                     self.shared.latest_text
                     and self.shared.latest_id
                     and self._can_send_now()
+                    and self._policy_ok(mode)
                     and (new_mic_pending or self.shared.latest_id != self._last_seen_mic_id)
                 ):
                     if self.shared.latest_id != self._last_seen_mic_id:
@@ -512,24 +615,31 @@ class Bot(commands.Bot):
                         if _is_callout_request(self.shared.latest_text):
                             m = self._direct_callout()
                         else:
-                            m = await self._ai(self.shared.latest_text, help_mode=help_mode)
+                            m = await self._ai(self.shared.latest_text, help_mode=help_mode, mode=mode)
                         if not m:
                             m = self._game_question() if (help_mode or ctx == "question") else None
                         message = m or (self._emote_only() if self.rng.random() < 0.3 else self._stock(ctx))
 
                 if not message and self._can_send_now() and self.shared.silence >= BACKGROUND_MIN_SILENCE:
-                    if self.rng.random() < BACKGROUND_LLM_PROB:
-                        message = await self._ai_background()
+                    mode = "idle_question"
+                    if self._policy_ok(mode) and self.rng.random() < BACKGROUND_LLM_PROB:
+                        message = await self._ai_background(mode=mode)
 
                 if not message and self._can_send_now() and self.shared.hype > 7:
-                    message = self._emote_only()
-                    self.shared.hype = 5
+                    mode = "emote_only"
+                    if self._policy_ok(mode):
+                        message = self._emote_only()
+                        self.shared.hype = 5
 
                 if not message and self._can_send_now() and self.rng.random() < 0.08:
-                    message = self._stock(ctx)
+                    mode = "emote_only" if self.rng.random() < 0.3 else "chat_reply"
+                    if self._policy_ok(mode):
+                        message = self._stock(ctx)
 
                 message = self._sanitize(message)
                 message = self._diversify(message, ctx=ctx, help_mode=help_mode)
+                if message and not self._policy_ok(mode, message):
+                    message = None
 
                 if message:
                     ch = self.connected_channels[0] if self.connected_channels else self.get_channel(TARGET_CHANNEL)
@@ -540,9 +650,12 @@ class Bot(commands.Bot):
                             message,
                             max_per_minute=GLOBAL_MAX_MSG_PER_MINUTE,
                             min_interval_s=GLOBAL_MIN_COOLDOWN_SECS,
+                            max_per_window=DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN,
+                            window_s=300.0,
                         )
                     if ch is not None and reserved:
                         await ch.send(message)
+                        self._last_send_mode = mode
                         self._mark_sent()
                         self._record_local_line(message)
                         tag = "HELP" if help_mode else "NORMAL"

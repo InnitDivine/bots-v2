@@ -91,6 +91,24 @@ TWITCH_CLIENT_SECRET = _env("TWITCH_CLIENT_SECRET")
 BOTS_FILE = _path_env("BOTS_FILE", str(ROOT / "bots.local.json"))
 BOTS_EXAMPLE_FILE = _path_env("BOTS_EXAMPLE_FILE", str(ROOT / "bots.example.json"))
 BOT_NAME_RE = re.compile(r"^[a-z0-9_]{4,25}$")
+MESSAGE_MODES = {
+    "idle_question",
+    "hype_reaction",
+    "fail_reaction",
+    "streamer_followup",
+    "game_question",
+    "emote_only",
+    "chat_reply",
+}
+DEFAULT_MESSAGE_MODES = [
+    "idle_question",
+    "hype_reaction",
+    "fail_reaction",
+    "streamer_followup",
+    "game_question",
+    "emote_only",
+]
+EMOTE_STYLES = {"none", "light", "balanced", "heavy"}
 
 
 def _env_suffix(name: str) -> str:
@@ -106,6 +124,52 @@ def _message_frequency(raw: Any) -> tuple[int, int]:
         except (TypeError, ValueError):
             pass
     return 45, 95
+
+
+def _bool_value(raw: Any, default: bool = False) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _int_value(raw: Any, default: int, low: int, high: int) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, value))
+
+
+def _float_value(raw: Any, default: float, low: float, high: float) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, value))
+
+
+def _string_value(raw: Any, default: str = "") -> str:
+    value = str(raw or "").strip()
+    return value or default
+
+
+def _message_modes(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",")]
+    if not isinstance(raw, list):
+        return list(DEFAULT_MESSAGE_MODES)
+    modes = []
+    for item in raw:
+        mode = str(item or "").strip()
+        if mode in MESSAGE_MODES and mode not in modes:
+            modes.append(mode)
+    return modes or list(DEFAULT_MESSAGE_MODES)
 
 
 def _load_bot_payload(path: Path) -> list[Any]:
@@ -132,14 +196,27 @@ def _bot_from_entry(entry: Any) -> dict[str, Any] | None:
     token_env = str(entry.get("token_env") or f"TWITCH_BOT_TOKEN_{suffix}")
     username_default = str(entry.get("username") or name).strip().lower()
     persona = entry.get("persona") if isinstance(entry.get("persona"), dict) else {}
+    emote_style = _string_value(entry.get("emote_style"), "balanced")
+    if emote_style not in EMOTE_STYLES:
+        emote_style = "balanced"
 
     return {
         "name": name,
         "username": _env(username_env, username_default),
         "token": _env(token_env),
         "message_frequency": _message_frequency(entry.get("message_frequency")),
-        "is_moderator": bool(entry.get("is_moderator", False)),
+        "is_moderator": _bool_value(entry.get("is_moderator"), False),
         "persona": persona,
+        "role": _string_value(entry.get("role"), "cast_member"),
+        "purpose": _string_value(entry.get("purpose"), _string_value(persona.get("description"), "support chat")),
+        "message_modes": _message_modes(entry.get("message_modes")),
+        "max_words": _int_value(entry.get("max_words"), 12, 1, 30),
+        "can_prompt_streamer": _bool_value(entry.get("can_prompt_streamer"), True),
+        "can_react_to_transcript": _bool_value(entry.get("can_react_to_transcript"), True),
+        "can_react_to_chat": _bool_value(entry.get("can_react_to_chat"), True),
+        "can_use_emotes": _bool_value(entry.get("can_use_emotes"), True),
+        "emote_style": emote_style,
+        "cooldown_multiplier": _float_value(entry.get("cooldown_multiplier"), 1.0, 0.25, 4.0),
     }
 
 
@@ -162,6 +239,43 @@ def load_bots(path: Path | str | None = None) -> list[dict[str, Any]]:
 
 BOTS = load_bots()
 
+
+def validate_bot_config(bot: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    name = str(bot.get("name") or "").strip()
+    if not BOT_NAME_RE.fullmatch(name):
+        errors.append("bot name must be 4-25 lowercase letters, numbers, or underscores")
+    if not str(bot.get("username") or "").strip():
+        errors.append(f"bot '{name or '?'}' missing username")
+    if not isinstance(bot.get("message_frequency"), tuple) or len(bot["message_frequency"]) != 2:
+        errors.append(f"bot '{name or '?'}' has invalid message_frequency")
+    modes = bot.get("message_modes")
+    if not isinstance(modes, list) or not modes or any(mode not in MESSAGE_MODES for mode in modes):
+        errors.append(f"bot '{name or '?'}' has invalid message_modes")
+    if int(bot.get("max_words", 0)) < 1:
+        errors.append(f"bot '{name or '?'}' max_words must be positive")
+    if str(bot.get("emote_style") or "") not in EMOTE_STYLES:
+        errors.append(f"bot '{name or '?'}' has invalid emote_style")
+    try:
+        cooldown = float(bot.get("cooldown_multiplier", 1.0))
+        if cooldown <= 0:
+            errors.append(f"bot '{name or '?'}' cooldown_multiplier must be positive")
+    except (TypeError, ValueError):
+        errors.append(f"bot '{name or '?'}' cooldown_multiplier must be numeric")
+    return errors
+
+
+def validate_bot_configs(bots: list[dict[str, Any]] | None = None) -> list[str]:
+    errors: list[str] = []
+    seen: set[str] = set()
+    for bot in bots if bots is not None else BOTS:
+        name = str(bot.get("name") or "").strip()
+        if name in seen:
+            errors.append(f"duplicate bot name '{name}'")
+        seen.add(name)
+        errors.extend(validate_bot_config(bot))
+    return errors
+
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-4o-mini")
 LLM_MAX_TOKENS = _int_env("LLM_MAX_TOKENS", 40)
@@ -178,6 +292,7 @@ CROSSBOT_RECENT_FILE = _env("CROSSBOT_RECENT_FILE", str(ROOT / "recent_messages.
 SHARED_META_FILE = _env("SHARED_META_FILE", str(ROOT / "shared_meta.json"))
 HEARTBEAT_DIR = _env("HEARTBEAT_DIR", str(ROOT / "run" / "heartbeats"))
 LOG_DIR = _env("LOG_DIR", str(ROOT / "run" / "logs"))
+DIVBOTS_MEMORY_FILE = _env("DIVBOTS_MEMORY_FILE", str(ROOT / "run" / "divbot_memory.json"))
 
 GAMEBANK_JSON = _env("GAMEBANK_JSON", str(ROOT / "gamebank.json"))
 GAMEBANK_TXT = _env("GAMEBANK_TXT", str(ROOT / "gamebank.txt"))
@@ -189,6 +304,11 @@ MAX_MSG_PER_MINUTE = _int_env("MAX_MSG_PER_MINUTE", 6)
 GLOBAL_MAX_MSG_PER_MINUTE = _int_env("GLOBAL_MAX_MSG_PER_MINUTE", 10)
 GLOBAL_MIN_COOLDOWN_SECS = _float_env("GLOBAL_MIN_COOLDOWN_SECS", 2.0)
 BASE_MIN_COOLDOWN_SECS = _int_env("BASE_MIN_COOLDOWN_SECS", 12)
+DIVBOTS_REAL_CHAT_SUPPRESSION_SECONDS = _float_env("DIVBOTS_REAL_CHAT_SUPPRESSION_SECONDS", 20.0)
+DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN = _int_env("DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN", 18)
+DIVBOTS_IDLE_ONLY = _truthy(_env("DIVBOTS_IDLE_ONLY", "false"))
+DIVBOTS_ASCII_ONLY = _truthy(_env("DIVBOTS_ASCII_ONLY", "true"))
+DIVBOTS_ALLOW_BOT_TO_BOT = _truthy(_env("DIVBOTS_ALLOW_BOT_TO_BOT", "false"))
 
 REALISTIC_MESSAGES = {
     "hype": ["LETS GOOO", "POGGERS", "W", "NO SHOT", "HUGE", "GIGACHAD"],
@@ -220,6 +340,7 @@ def validate_runtime(require_helix: bool = True) -> list[str]:
 
     if not BOTS:
         errors.append("No bots configured; run quickstart.py or create bots.local.json")
+    errors.extend(validate_bot_configs(BOTS))
 
     for bot in BOTS:
         if not bot["token"]:

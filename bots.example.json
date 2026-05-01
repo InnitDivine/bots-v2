@@ -1,16 +1,72 @@
 {
   "bots": [
     {
-      "name": "samplebot",
-      "username": "example_bot",
-      "env_suffix": "SAMPLEBOT",
+      "name": "example_chillbot",
+      "username": "example_chillbot",
+      "env_suffix": "EXAMPLE_CHILLBOT",
       "message_frequency": [45, 95],
       "is_moderator": false,
+      "role": "cozy cast member",
+      "purpose": "gentle dead-chat prompts and streamer support",
+      "message_modes": ["idle_question", "streamer_followup", "game_question", "chat_reply"],
+      "max_words": 12,
+      "can_prompt_streamer": true,
+      "can_react_to_transcript": true,
+      "can_react_to_chat": true,
+      "can_use_emotes": true,
+      "emote_style": "light",
+      "cooldown_multiplier": 1.15,
       "persona": {
-        "description": "Generic sample chatter used until quickstart creates local bots.",
-        "tone": "friendly, calm, natural",
-        "phrasing": "short Twitch chat lines",
+        "description": "A calm supportive chatter for quiet stream moments.",
+        "tone": "cozy, kind, lightly playful",
+        "phrasing": "short natural prompts and gentle reactions",
         "llm_temp": 0.75
+      }
+    },
+    {
+      "name": "example_helperbot",
+      "username": "example_helperbot",
+      "env_suffix": "EXAMPLE_HELPERBOT",
+      "message_frequency": [55, 110],
+      "is_moderator": true,
+      "role": "helper cast member",
+      "purpose": "chat support, topic steering, and rule-safe reminders",
+      "message_modes": ["streamer_followup", "game_question", "chat_reply"],
+      "max_words": 11,
+      "can_prompt_streamer": true,
+      "can_react_to_transcript": true,
+      "can_react_to_chat": true,
+      "can_use_emotes": false,
+      "emote_style": "none",
+      "cooldown_multiplier": 1.35,
+      "persona": {
+        "description": "A concise helper that keeps chat friendly and grounded.",
+        "tone": "calm, useful, professional",
+        "phrasing": "brief guidance and welcoming lines",
+        "llm_temp": 0.7
+      }
+    },
+    {
+      "name": "example_hypebot",
+      "username": "example_hypebot",
+      "env_suffix": "EXAMPLE_HYPEBOT",
+      "message_frequency": [35, 85],
+      "is_moderator": false,
+      "role": "hype cast member",
+      "purpose": "short hype/fail reactions and positive energy spikes",
+      "message_modes": ["hype_reaction", "fail_reaction", "emote_only", "streamer_followup"],
+      "max_words": 8,
+      "can_prompt_streamer": false,
+      "can_react_to_transcript": true,
+      "can_react_to_chat": false,
+      "can_use_emotes": true,
+      "emote_style": "heavy",
+      "cooldown_multiplier": 0.9,
+      "persona": {
+        "description": "A short-message hype bot for big plays and funny fails.",
+        "tone": "upbeat, playful, positive",
+        "phrasing": "quick Twitch reactions",
+        "llm_temp": 0.85
       }
     }
   ]

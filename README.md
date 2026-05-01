@@ -1,63 +1,75 @@
-# bots-v2
+# DivBots
 
-Multi-account Twitch chat bot system using TwitchIO, OpenAI, Twitch Helix, optional Azure STT, and shared local JSON state.
+DivBots is a multi-account Twitch chat bot system.
 
-## Setup
+It runs several Twitch bot accounts as a visible bot cast: distinct personas for banter, dead-chat prompts, hype/fail reactions, streamer conversation support, and transcript-reactive chat. DivBots is not viewbotting, followbotting, fake metrics, or hidden impersonation.
 
-Install Python dependencies:
+## Install
+
+Python 3.11+ recommended.
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
 python -m pip install -r requirements.txt
-```
-
-Create your local env file:
-
-```powershell
 Copy-Item .env.example .env
-```
-
-Run the guided setup:
-
-```powershell
 python quickstart.py
 ```
 
-Quickstart asks for Twitch app credentials, OpenAI settings, optional Azure/HTTP transcript settings, then lets you add bot accounts one at a time. Bot login uses the local Twitch OAuth callback and writes tokens to `.env`.
-
-Quickstart writes real bot accounts and AI-generated personas to ignored `bots.local.json`. The tracked `bots.example.json` is only a generic sample.
-
-Or add more bot accounts later:
-
-```powershell
-python add_bot_assistant.py --count 3
-```
+Quickstart writes secrets to `.env` and local bot cast config to ignored `bots.local.json`. Keep `bots.example.json` generic.
 
 ## Run
 
-Safe connect-only check:
+Safe connect check; no chat sent:
 
 ```powershell
 python runner.py --bot <botname> --smoketest --no-mic --no-helix
 ```
 
-Launch all bots:
+Launch all configured bots:
 
 ```powershell
 python launch_multi.py
 ```
 
-Watchdog mode:
+Status/doctor:
 
 ```powershell
-python launch_multi.py --use-watchdog
+python status.py
+python launch_multi.py --status
+python tools/offline_check.py
 ```
 
-## Notes
+Local control via primary window:
 
-- Leave token fields blank in `.env.example`; real tokens belong only in `.env`.
-- Real bot usernames/personas belong in ignored `bots.local.json`, not tracked Python files.
-- Tokens must use the `oauth:` prefix and placeholder values are rejected.
-- Runtime files, logs, caches, shared JSON state, and `.env` are ignored.
-- Smoketest does not send chat unless `--send-smoketest-message` is passed.
+```powershell
+python launch_multi.py --inject-stdin
+```
 
-Full instructions: [docs/HOW_TO_RUN.md](docs/HOW_TO_RUN.md)
+Commands:
+
+```text
+!divbots status
+!divbots quiet
+!divbots resume
+!divbots stop
+!divbots topic <topic>
+!divbots hype
+!divbots reload
+!divbots forget <topic>
+!divbots block <phrase>
+```
+
+Chat commands are intended for broadcaster/moderators. Local stdin accepts them for testing.
+
+## Safety
+
+- `.env` stores secrets.
+- `bots.local.json` stores real local bot cast config.
+- `bots.example.json` stays generic.
+- Smoketest does not send unless `--send-smoketest-message`.
+- Runtime JSON, logs, caches, heartbeats, and `.env` ignored.
+- Tokens must use `oauth:` prefix.
+- Policy envs: `DIVBOTS_REAL_CHAT_SUPPRESSION_SECONDS`, `DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN`, `DIVBOTS_IDLE_ONLY`, `DIVBOTS_ASCII_ONLY`, `DIVBOTS_ALLOW_BOT_TO_BOT`.
+
+More: [docs/HOW_TO_RUN.md](docs/HOW_TO_RUN.md)

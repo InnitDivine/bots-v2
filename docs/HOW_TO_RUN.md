@@ -1,110 +1,141 @@
-# How To Run
+# How To Run DivBots
 
-## Safety Defaults
-
-- Keep secrets in `.env` only. Commit/share `.env.example`, not `.env`.
-- Runtime files under `run/`, logs, heartbeats, caches, and shared JSON state are ignored.
-- Smoketest connects only; it does not send chat unless `--send-smoketest-message` is passed.
-
-## Setup
-
-1. Install dependencies:
+## 1. Install
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
 python -m pip install -r requirements.txt
 ```
 
-2. Copy `.env.example` to `.env`, then fill required values:
+Use Python 3.11+. Python 3.12 works well on Windows.
+
+## 2. Env
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Required runtime values:
+Required live values:
 
 - `OPENAI_API_KEY`
 - `TWITCH_CLIENT_ID`
 - `TWITCH_CLIENT_SECRET`
-- one `TWITCH_BOT_TOKEN_<BOTNAME>` value per bot
+- one `TWITCH_BOT_TOKEN_<BOTNAME>` per bot
 
-TwitchIO tokens must use `oauth:` prefix.
-Real bot accounts and AI-generated personas are stored in ignored `bots.local.json`. The tracked `bots.example.json` is only a generic sample.
+Secrets live in `.env` only. Do not commit `.env`.
 
-## Guided Quickstart
+## 3. Bot Cast
 
-Run this for first setup:
+Preferred:
 
 ```powershell
 python quickstart.py
 ```
 
-It asks for Twitch, OpenAI, optional Azure or HTTP transcript settings, then lets you add bot accounts one by one. Each bot login uses the same OAuth callback flow as `generate_twitch_bot_tokens.py`, and tokens are written to `.env` without being printed.
+Quickstart:
 
-## Generate Twitch Bot Tokens
+- asks target channel, broadcaster aliases, OpenAI model
+- asks Twitch app credentials
+- asks Azure or HTTP transcript settings
+- opens Twitch OAuth once per bot account
+- writes tokens to `.env`
+- writes personas/cast config to ignored `bots.local.json`
 
-Register redirect URI in Twitch app settings, then run:
-
-```powershell
-python generate_twitch_bot_tokens.py --redirect-uri http://localhost:3000/callback --write-env
-```
-
-The helper validates OAuth state, writes `oauth:`-prefixed tokens, and does not print token values.
-
-## Add Bot Accounts
-
-To add several bots and let AI generate a short role/persona for each one:
+Add more bots later:
 
 ```powershell
 python add_bot_assistant.py --count 3
 ```
 
-The assistant opens a Twitch login for each bot account, writes tokens to `.env`, and writes each bot plus its AI-generated role to ignored `bots.local.json`.
+Generic schema lives in `bots.example.json`. Real bot names/personas belong in `bots.local.json`.
 
-## Smoke Test
+## 4. Safe Checks
 
-Safe default:
+Offline:
+
+```powershell
+python -m compileall -q .
+python tools/offline_check.py
+python status.py
+```
+
+Safe Twitch connect; no chat sent:
 
 ```powershell
 python runner.py --bot <botname> --smoketest --no-mic --no-helix
 ```
 
-Send one live test chat message only when intended:
+Send one live test message only when intended:
 
 ```powershell
 python runner.py --bot <botname> --smoketest --no-mic --no-helix --send-smoketest-message
 ```
 
-## Normal Run
-
-Launch all bots in separate windows:
+## 5. Live Run
 
 ```powershell
 python launch_multi.py
 ```
 
-Default behavior:
+Default:
 
-- First bot handles mic and Helix.
-- Other bots run chatter-only with `--no-mic --no-helix`.
-- Bots sync through locked shared JSON files.
-- Per-bot cooldown and global combined throttle limit chat spam.
+- first bot handles mic + Helix
+- other bots chatter-only
+- shared JSON sync uses locks + atomic writes
+- per-bot cooldown + global throttle active
 
-## Optional Watchdog
+With watchdog:
 
 ```powershell
 python launch_multi.py --use-watchdog
 ```
 
-## Manual Transcript Injection
+With local controls:
 
 ```powershell
 python launch_multi.py --inject-stdin
 ```
 
-Type lines into primary window at `inject>` prompt.
+## 6. Commands
 
-## Syntax Check
+Broadcaster/mod chat commands:
+
+```text
+!divbots status
+!divbots quiet
+!divbots resume
+!divbots stop
+!divbots topic <topic>
+!divbots hype
+!divbots reload
+!divbots forget <topic>
+!divbots block <phrase>
+```
+
+Local stdin accepts same commands when `--inject-stdin` enabled.
+
+## 7. Demo Overlay
+
+Testing-only local overlay; does not send chat or inflate viewers.
 
 ```powershell
-python -m compileall -q .
+python -m http.server 8765
 ```
+
+Open:
+
+```text
+http://127.0.0.1:8765/overlay_demo.html
+```
+
+It reads `recent_messages.json` from local repo root.
+
+## 8. Troubleshooting
+
+- `redirect_mismatch` → Twitch app redirect URL must exactly match quickstart redirect, usually `http://localhost:3000/callback`.
+- `Malformed token` → token must start with `oauth:`.
+- no bot choices → run quickstart or create `bots.local.json`.
+- no transcript reactions → check Azure key or `TRANSCRIPT_HTTP_ENDPOINT`.
+- no Helix/game context → check `TWITCH_CLIENT_ID` + `TWITCH_CLIENT_SECRET`.
+- too much chat → raise `BASE_MIN_COOLDOWN_SECS`, lower `DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN`, or set `DIVBOTS_IDLE_ONLY=true`.

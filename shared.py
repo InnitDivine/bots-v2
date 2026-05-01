@@ -152,6 +152,10 @@ class SharedState:
         self.hype: int = 0
         self.detected_emotion: str = "neutral"
         self.help_mode: bool = False
+        self.last_real_chat_at: float = 0.0
+        self.quiet_until: float = 0.0
+        self.stopped: bool = False
+        self.manual_topic: str = ""
 
         self.silence: float = 0.0
         self.latest_text: str = ""
@@ -167,6 +171,36 @@ class SharedState:
     def set_global_emotes(self, names: list[str]) -> None:
         self.global_emotes = names or []
         self._merge_meta({"global_emotes": self.global_emotes})
+
+    def mark_real_chat(self) -> None:
+        self.last_real_chat_at = time.time()
+        self._merge_meta({"last_real_chat_at": self.last_real_chat_at})
+
+    def set_quiet(self, seconds: float = 300.0) -> None:
+        self.quiet_until = time.time() + max(1.0, float(seconds))
+        self.stopped = False
+        self._merge_meta({"quiet_until": self.quiet_until, "stopped": False})
+
+    def resume(self) -> None:
+        self.quiet_until = 0.0
+        self.stopped = False
+        self._merge_meta({"quiet_until": 0.0, "stopped": False})
+
+    def stop_cast(self) -> None:
+        self.stopped = True
+        self._merge_meta({"stopped": True})
+
+    def set_topic(self, topic: str) -> None:
+        self.manual_topic = (topic or "").strip()[:140]
+        self._merge_meta({"manual_topic": self.manual_topic})
+
+    def boost_hype(self) -> None:
+        self.hype = 9
+        self.detected_emotion = "hype"
+        self._merge_meta({"hype": self.hype, "detected_emotion": self.detected_emotion})
+
+    def is_quiet(self) -> bool:
+        return self.stopped or time.time() < self.quiet_until
 
     def on_text(self, text: str, final: bool = True) -> None:
         if not final:
@@ -251,6 +285,20 @@ class SharedState:
             self.detected_emotion = data["detected_emotion"].strip() or "neutral"
         if isinstance(data.get("help_mode"), bool):
             self.help_mode = data["help_mode"]
+        if "last_real_chat_at" in data:
+            try:
+                self.last_real_chat_at = float(data["last_real_chat_at"])
+            except (TypeError, ValueError):
+                pass
+        if "quiet_until" in data:
+            try:
+                self.quiet_until = float(data["quiet_until"])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(data.get("stopped"), bool):
+            self.stopped = data["stopped"]
+        if isinstance(data.get("manual_topic"), str):
+            self.manual_topic = data["manual_topic"].strip()
 
     def _read_recent_payload_unlocked(self) -> dict[str, Any]:
         data = _read_json(self.recent_messages_path, {"messages": []})
@@ -288,6 +336,8 @@ class SharedState:
         ttl_s: float = 120.0,
         max_per_minute: int | None = None,
         min_interval_s: float = 0.0,
+        max_per_window: int | None = None,
+        window_s: float = 300.0,
     ) -> bool:
         norm = _norm_msg(message)
         if not norm:
@@ -309,6 +359,12 @@ class SharedState:
             if min_interval_s > 0 and kept:
                 latest = max(float(row.get("ts", 0)) for row in kept)
                 if now - latest < min_interval_s:
+                    data["messages"] = kept
+                    self._write_recent_payload_unlocked(data)
+                    return False
+            if max_per_window is not None and max_per_window >= 0:
+                window_count = sum(1 for row in kept if now - float(row.get("ts", 0)) <= window_s)
+                if window_count >= max_per_window:
                     data["messages"] = kept
                     self._write_recent_payload_unlocked(data)
                     return False

@@ -204,6 +204,23 @@ def bot_config_entry(draft: BotDraft) -> dict[str, Any]:
         "token_env": f"TWITCH_BOT_TOKEN_{env_suffix}",
         "message_frequency": [low, high],
         "is_moderator": bool(draft.is_moderator),
+        "role": "moderator support" if draft.is_moderator else "cast member",
+        "purpose": validate_persona(draft.persona)["description"],
+        "message_modes": [
+            "idle_question",
+            "hype_reaction",
+            "fail_reaction",
+            "streamer_followup",
+            "game_question",
+            "emote_only",
+        ],
+        "max_words": 12,
+        "can_prompt_streamer": True,
+        "can_react_to_transcript": True,
+        "can_react_to_chat": True,
+        "can_use_emotes": not draft.is_moderator,
+        "emote_style": "light" if draft.is_moderator else "balanced",
+        "cooldown_multiplier": 1.2 if draft.is_moderator else 1.0,
         "persona": validate_persona(draft.persona),
     }
 

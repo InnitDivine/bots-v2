@@ -21,6 +21,8 @@ from config import (
     TARGET_CHANNEL,
     validate_runtime,
 )
+from divbot_commands import apply_divbots_command
+from divbot_memory import DivBotMemory
 from gamebank import GameBankManager
 from helix import Helix
 from mic_inline import InlineMic
@@ -50,6 +52,7 @@ def _build_persona(bot_conf: dict[str, Any]) -> Persona:
         bot_conf["token"],
         bot_conf["message_frequency"],
         bot_conf.get("is_moderator", False),
+        bot_conf,
     )
 
 
@@ -87,6 +90,7 @@ async def _heartbeat_loop(stop_event: asyncio.Event, bot_name: str):
 
 
 async def _stdin_inject_loop(stop_event: asyncio.Event, shared: SharedState):
+    memory = DivBotMemory()
     while not stop_event.is_set():
         try:
             line = await asyncio.to_thread(input, "inject> ")
@@ -97,6 +101,14 @@ async def _stdin_inject_loop(stop_event: asyncio.Event, shared: SharedState):
         if line.strip().lower() in {"quit", "exit"}:
             stop_event.set()
             return
+        result = apply_divbots_command(line, shared, memory, local=True)
+        if result.handled:
+            if result.response:
+                print(result.response)
+            if result.should_exit:
+                stop_event.set()
+                return
+            continue
         shared.on_text(line, final=True)
 
 

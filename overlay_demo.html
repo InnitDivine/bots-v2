@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DivBots Demo Overlay</title>
+  <style>
+    body {
+      margin: 0;
+      background: transparent;
+      font-family: Arial, sans-serif;
+      color: #f7f7fb;
+    }
+    .chat {
+      width: 420px;
+      padding: 14px;
+      background: rgba(12, 12, 16, 0.82);
+      border-left: 4px solid #9146ff;
+    }
+    .title {
+      font-weight: 700;
+      margin-bottom: 10px;
+      color: #cdb8ff;
+    }
+    .line {
+      margin: 7px 0;
+      line-height: 1.25;
+      word-break: break-word;
+    }
+    .bot {
+      color: #6ee7b7;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <div class="chat">
+    <div class="title">DivBots local demo</div>
+    <div id="lines"></div>
+  </div>
+  <script>
+    const lines = document.getElementById("lines");
+
+    async function refresh() {
+      try {
+        const response = await fetch("recent_messages.json?ts=" + Date.now());
+        const payload = await response.json();
+        const messages = Array.isArray(payload.messages) ? payload.messages.slice(-8) : [];
+        lines.innerHTML = messages.map((row) => {
+          const bot = String(row.bot || "divbot").replace(/[<>&]/g, "");
+          const raw = String(row.raw || "").replace(/[<>&]/g, "");
+          return `<div class="line"><span class="bot">${bot}</span>: ${raw}</div>`;
+        }).join("") || "<div class='line'>Waiting for local demo messages...</div>";
+      } catch {
+        lines.innerHTML = "<div class='line'>Serve repo root with python -m http.server to preview.</div>";
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 1500);
+  </script>
+</body>
+</html>
