@@ -31,8 +31,10 @@ from config import (
     TYPING_PATTERNS,
 )
 from divbot_commands import apply_divbots_command
+from divbot_judge import judge_enabled, judge_message
 from divbot_memory import DivBotMemory
 from divbot_policy import BotPolicyState, PolicyConfig, decide_send, mark_send, sanitize_message
+from divbot_viewers import DivBotViewers
 from gamebank import GameBankManager
 from shared import SharedState
 
@@ -144,6 +146,7 @@ class Bot(commands.Bot):
         self.shared = shared
         self.gb = gb
         self.memory = DivBotMemory()
+        self.viewers = DivBotViewers()
         self.policy_config = PolicyConfig.from_env()
         self.policy_state = BotPolicyState()
 
@@ -158,6 +161,8 @@ class Bot(commands.Bot):
         self._recent_chat: deque[tuple[str, str, float]] = deque(maxlen=RECENT_CHAT_CONTEXT)
         self._recent_mic_lines: deque[str] = deque(maxlen=RECENT_MIC_LINES)
         self._bot_usernames = {b["username"].strip().lower() for b in BOTS if b.get("username")}
+        self._last_seen_orchestrator_hint = ""
+        self._judge_drop_count = 0
 
     def _setting(self, name: str, default):
         return self.p.settings.get(name, default)
@@ -187,6 +192,7 @@ class Bot(commands.Bot):
             author = ""
             if message.author is not None and getattr(message.author, "name", None):
                 author = str(message.author.name).strip()
+            display_name = str(getattr(message.author, "display_name", None) or author).strip()
             text = (message.content or "").strip()
             if not author or not text:
                 return
@@ -205,23 +211,70 @@ class Bot(commands.Bot):
             # Ignore our bot trio for context; keep real chatter and broadcaster lines.
             if author.lower() in self._bot_usernames and not DIVBOTS_ALLOW_BOT_TO_BOT:
                 return
-            self.shared.mark_real_chat()
+            is_mod, is_broadcaster = self._author_roles(message, author)
+            self.shared.mark_real_chat(author, display_name)
+            self.viewers.observe_message(author, display_name, is_mod=is_mod, is_broadcaster=is_broadcaster)
             self._recent_chat.append((author, text, time.time()))
         except Exception:
             return
 
     def _command_authorized(self, message, author: str) -> bool:
+        is_mod, is_broadcaster = self._author_roles(message, author)
+        return is_mod or is_broadcaster
+
+    def _author_roles(self, message, author: str) -> tuple[bool, bool]:
         if author.strip().lower() == TARGET_CHANNEL.lower():
-            return True
+            return False, True
+        is_mod = False
+        is_broadcaster = False
         author_obj = getattr(message, "author", None)
-        for attr in ("is_mod", "mod", "is_broadcaster", "broadcaster"):
-            if bool(getattr(author_obj, attr, False)):
-                return True
+        for attr in ("is_mod", "mod"):
+            is_mod = is_mod or bool(getattr(author_obj, attr, False))
+        for attr in ("is_broadcaster", "broadcaster"):
+            is_broadcaster = is_broadcaster or bool(getattr(author_obj, attr, False))
         tags = getattr(message, "tags", {}) or {}
         if isinstance(tags, dict):
             badges = str(tags.get("badges") or tags.get("badge-info") or "").lower()
-            return "moderator" in badges or "broadcaster" in badges
-        return False
+            is_mod = is_mod or "moderator" in badges
+            is_broadcaster = is_broadcaster or "broadcaster" in badges
+        return is_mod, is_broadcaster
+
+    def _ctx_for_mode(self, mode: str, fallback: str) -> str:
+        if mode in {"hype_reaction", "emote_only"}:
+            return "hype"
+        if mode == "fail_reaction":
+            return "fail"
+        if mode in {"game_question", "idle_question", "streamer_followup", "chat_reply"}:
+            return "question"
+        return fallback
+
+    def _viewer_callout(self) -> Optional[str]:
+        line = self.viewers.helper_viewer_callout(
+            self.shared.last_real_chat_login,
+            exclude_logins={*self._bot_usernames, TARGET_CHANNEL.lower()},
+        )
+        return self._sanitize(line)
+
+    def _judge_context(self) -> str:
+        return (
+            f"mic={self._mic_hint()}; chat={self._chat_hint()}; "
+            f"recent_sent={self._recent_hint()}; game={self.shared.game or 'unknown'}"
+        )
+
+    async def _judge_ok(self, mode: str, message: str) -> bool:
+        if not judge_enabled():
+            return True
+        result = await judge_message(
+            self.ai,
+            persona={"name": self.p.name, "persona": _persona_style(self.p.name), "settings": self.p.settings},
+            mode=mode,
+            message=message,
+            recent_context=self._judge_context(),
+        )
+        if not result.passed:
+            self._judge_drop_count += 1
+            print(f"judge dropped {self.p.name} line: {result.reason}")
+        return result.passed
 
     async def event_disconnect(self):
         if self._chat_task and not self._chat_task.done():
@@ -566,6 +619,13 @@ class Bot(commands.Bot):
                     self.shared.refresh_transcript()
                     self.shared.refresh_meta()
                     remaining -= step
+                    hint = self.shared.next_speaker_for(self.p.name)
+                    if (
+                        hint
+                        and str(hint.get("id") or "") != self._last_seen_orchestrator_hint
+                        and self._can_send_now()
+                    ):
+                        break
                     if (
                         self.shared.latest_id
                         and self.shared.latest_id != self._last_seen_mic_id
@@ -600,6 +660,20 @@ class Bot(commands.Bot):
                 else:
                     mode = "idle_question"
 
+                active_hint = self.shared.active_next_speaker_hint()
+                hint_for_me = self.shared.next_speaker_for(self.p.name)
+                hint_id = str(hint_for_me.get("id") or "") if hint_for_me else ""
+                if active_hint and not hint_for_me:
+                    continue
+                if hint_for_me:
+                    if hint_id == self._last_seen_orchestrator_hint:
+                        continue
+                    hinted_mode = str(hint_for_me.get("mode") or "").strip()
+                    if hinted_mode:
+                        mode = hinted_mode
+                        ctx = self._ctx_for_mode(mode, ctx)
+                        help_mode = mode in {"streamer_followup", "game_question", "chat_reply"}
+
                 message: Optional[str] = None
 
                 if (
@@ -607,18 +681,29 @@ class Bot(commands.Bot):
                     and self.shared.latest_id
                     and self._can_send_now()
                     and self._policy_ok(mode)
-                    and (new_mic_pending or self.shared.latest_id != self._last_seen_mic_id)
+                    and (new_mic_pending or self.shared.latest_id != self._last_seen_mic_id or hint_for_me)
+                    and mode in {"hype_reaction", "fail_reaction", "streamer_followup", "game_question"}
                 ):
                     if self.shared.latest_id != self._last_seen_mic_id:
                         self._last_seen_mic_id = self.shared.latest_id
-                        self._recent_mic_lines.append(self.shared.latest_text)
-                        if _is_callout_request(self.shared.latest_text):
-                            m = self._direct_callout()
-                        else:
-                            m = await self._ai(self.shared.latest_text, help_mode=help_mode, mode=mode)
-                        if not m:
-                            m = self._game_question() if (help_mode or ctx == "question") else None
-                        message = m or (self._emote_only() if self.rng.random() < 0.3 else self._stock(ctx))
+                    self._recent_mic_lines.append(self.shared.latest_text)
+                    if _is_callout_request(self.shared.latest_text):
+                        m = self._direct_callout()
+                    else:
+                        m = await self._ai(self.shared.latest_text, help_mode=help_mode, mode=mode)
+                    if not m:
+                        m = self._game_question() if (help_mode or ctx == "question") else None
+                    message = m or (self._emote_only() if self.rng.random() < 0.3 else self._stock(ctx))
+
+                if hint_for_me and not message and self._can_send_now() and self._policy_ok(mode):
+                    if mode == "chat_reply":
+                        message = self._viewer_callout() or await self._ai_background(mode=mode)
+                    elif mode == "emote_only":
+                        message = self._emote_only()
+                    elif mode == "game_question":
+                        message = self._game_question()
+                    elif mode == "idle_question":
+                        message = await self._ai_background(mode=mode) or self._stock("question")
 
                 if not message and self._can_send_now() and self.shared.silence >= BACKGROUND_MIN_SILENCE:
                     mode = "idle_question"
@@ -640,6 +725,8 @@ class Bot(commands.Bot):
                 message = self._diversify(message, ctx=ctx, help_mode=help_mode)
                 if message and not self._policy_ok(mode, message):
                     message = None
+                if message and not await self._judge_ok(mode, message):
+                    message = None
 
                 if message:
                     ch = self.connected_channels[0] if self.connected_channels else self.get_channel(TARGET_CHANNEL)
@@ -658,8 +745,16 @@ class Bot(commands.Bot):
                         self._last_send_mode = mode
                         self._mark_sent()
                         self._record_local_line(message)
+                        if hint_id:
+                            self._last_seen_orchestrator_hint = hint_id
+                            self.shared.clear_next_speaker_hint(hint_id)
                         tag = "HELP" if help_mode else "NORMAL"
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.p.name} -> '{message}' [{tag}/{ctx.upper()}]")
+                    elif hint_id:
+                        self._last_seen_orchestrator_hint = hint_id
+                        self.shared.clear_next_speaker_hint(hint_id)
+                elif hint_id:
+                    self._last_seen_orchestrator_hint = hint_id
 
                 if not urgent and not self._lurk_active():
                     self._maybe_enter_lurk()

@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--inject-stdin", action="store_true")
     parser.add_argument("--use-watchdog", action="store_true", help="Launch watchdog supervisor instead of direct windows")
     parser.add_argument("--status", action="store_true", help="Print safe local DivBots status and exit")
+    parser.add_argument("--orchestrator", action="store_true", help="Launch one cast planner process")
     args = parser.parse_args()
 
     if args.status:
@@ -39,6 +40,13 @@ def main():
 
     cwd = os.path.abspath(os.path.dirname(__file__))
     runner = os.path.join(cwd, "runner.py")
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+
+    if args.orchestrator:
+        orchestrator = os.path.join(cwd, "orchestrator.py")
+        cmd = [sys.executable, "-u", orchestrator]
+        subprocess.Popen(cmd, cwd=cwd, creationflags=creationflags, shell=False)
+        print(f"launched orchestrator: {' '.join(cmd)}")
 
     if args.use_watchdog:
         watchdog = os.path.join(cwd, "watchdog.py")
@@ -56,8 +64,6 @@ def main():
         subprocess.Popen(cmd, cwd=cwd, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010), shell=False)
         print(f"launched watchdog: {' '.join(cmd)}")
         return
-
-    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 
     for i, name in enumerate(selected):
         cmd = [sys.executable, "-u", runner, "--bot", name]

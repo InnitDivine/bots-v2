@@ -58,6 +58,7 @@ Offline:
 python -m compileall -q .
 python tools/offline_check.py
 python status.py
+python orchestrator.py --once
 ```
 
 Safe Twitch connect; no chat sent:
@@ -84,6 +85,14 @@ Default:
 - other bots chatter-only
 - shared JSON sync uses locks + atomic writes
 - per-bot cooldown + global throttle active
+
+Recommended cast-planner mode:
+
+```powershell
+python launch_multi.py --orchestrator
+```
+
+The orchestrator watches shared transcript/meta/chat activity and writes one short-lived `next_speaker` hint. Bots not chosen skip that trigger, so the cast feels coordinated instead of clumped.
 
 With watchdog:
 
@@ -115,7 +124,24 @@ Broadcaster/mod chat commands:
 
 Local stdin accepts same commands when `--inject-stdin` enabled.
 
-## 7. Demo Overlay
+## 7. Memory + Judge
+
+Viewer memory is local and ignored:
+
+- `DIVBOTS_VIEWERS_FILE=run/divbot_viewers.json`
+- stores public Twitch logins, counts, and callout cooldowns
+- lets one selected bot say short regular-viewer callouts like `yo example_user`
+
+Optional outgoing-line judge:
+
+```powershell
+DIVBOTS_USE_JUDGE=true
+DIVBOTS_JUDGE_MODEL=gpt-4o-mini
+```
+
+Judge uses OpenAI and is off by default.
+
+## 8. Demo Overlay
 
 Testing-only local overlay; does not send chat or inflate viewers.
 
@@ -131,7 +157,7 @@ http://127.0.0.1:8765/overlay_demo.html
 
 It reads `recent_messages.json` from local repo root.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 - `redirect_mismatch` → Twitch app redirect URL must exactly match quickstart redirect, usually `http://localhost:3000/callback`.
 - `Malformed token` → token must start with `oauth:`.
@@ -139,3 +165,4 @@ It reads `recent_messages.json` from local repo root.
 - no transcript reactions → check Azure key or `TRANSCRIPT_HTTP_ENDPOINT`.
 - no Helix/game context → check `TWITCH_CLIENT_ID` + `TWITCH_CLIENT_SECRET`.
 - too much chat → raise `BASE_MIN_COOLDOWN_SECS`, lower `DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN`, or set `DIVBOTS_IDLE_ONLY=true`.
+- bots clump on same trigger → use `python launch_multi.py --orchestrator`.

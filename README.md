@@ -32,12 +32,19 @@ Launch all configured bots:
 python launch_multi.py
 ```
 
+Launch with one cast planner so only one bot reacts per shared trigger:
+
+```powershell
+python launch_multi.py --orchestrator
+```
+
 Status/doctor:
 
 ```powershell
 python status.py
 python launch_multi.py --status
 python tools/offline_check.py
+python orchestrator.py --once
 ```
 
 Local control via primary window:
@@ -71,5 +78,8 @@ Chat commands are intended for broadcaster/moderators. Local stdin accepts them 
 - Runtime JSON, logs, caches, heartbeats, and `.env` ignored.
 - Tokens must use `oauth:` prefix.
 - Policy envs: `DIVBOTS_REAL_CHAT_SUPPRESSION_SECONDS`, `DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN`, `DIVBOTS_IDLE_ONLY`, `DIVBOTS_ASCII_ONLY`, `DIVBOTS_ALLOW_BOT_TO_BOT`.
+- Orchestrator envs: `DIVBOTS_ORCHESTRATOR_TICK_SECS`, `DIVBOTS_ORCHESTRATOR_HINT_TTL_SECS`, `DIVBOTS_ORCHESTRATOR_IDLE_SILENCE_SECS`.
+- Viewer memory lives in ignored `DIVBOTS_VIEWERS_FILE`.
+- Optional LLM judge is off unless `DIVBOTS_USE_JUDGE=true`.
 
 More: [docs/HOW_TO_RUN.md](docs/HOW_TO_RUN.md)

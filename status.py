@@ -6,6 +6,7 @@ from typing import Any
 from config import (
     BOTS,
     CROSSBOT_RECENT_FILE,
+    DIVBOTS_VIEWERS_FILE,
     HELIX_CACHE_FILE,
     HEARTBEAT_DIR,
     SHARED_META_FILE,
@@ -49,6 +50,13 @@ def _recent_count() -> int:
     return 0
 
 
+def _viewer_count() -> int:
+    data = _read_json(DIVBOTS_VIEWERS_FILE)
+    if isinstance(data, dict) and isinstance(data.get("viewers"), dict):
+        return len(data["viewers"])
+    return 0
+
+
 def main() -> None:
     meta = _read_json(SHARED_META_FILE) or {}
     transcript = _read_json(SHARED_TRANSCRIPT_FILE)
@@ -76,8 +84,24 @@ def main() -> None:
     print(f"meta file: {SHARED_META_FILE}")
     print(f"recent file: {CROSSBOT_RECENT_FILE}")
     print(f"global throttle count last 60s: {_recent_count()}")
+    print(f"viewer memory count: {_viewer_count()} ({DIVBOTS_VIEWERS_FILE})")
     print(f"helix cache: {'present' if helix is not None else 'missing'} ({HELIX_CACHE_FILE})")
     print(f"last game: {meta.get('game', 'unknown') if isinstance(meta, dict) else 'unknown'}")
+    hint = meta.get("next_speaker") if isinstance(meta, dict) else None
+    active_hint = False
+    if isinstance(hint, dict):
+        try:
+            active_hint = time.time() < float(hint.get("expires_at", 0))
+        except (TypeError, ValueError):
+            active_hint = False
+    if isinstance(hint, dict) and active_hint:
+        print(
+            "next speaker: "
+            f"bot={hint.get('bot', '')} mode={hint.get('mode', '')} "
+            f"reason={hint.get('reason', '')} expires_at={hint.get('expires_at', 0)}"
+        )
+    else:
+        print("next speaker: none")
     print(
         "state: "
         f"hype={meta.get('hype', 0) if isinstance(meta, dict) else 0} "

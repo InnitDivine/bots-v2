@@ -153,9 +153,12 @@ class SharedState:
         self.detected_emotion: str = "neutral"
         self.help_mode: bool = False
         self.last_real_chat_at: float = 0.0
+        self.last_real_chat_login: str = ""
+        self.last_real_chat_display: str = ""
         self.quiet_until: float = 0.0
         self.stopped: bool = False
         self.manual_topic: str = ""
+        self.next_speaker_hint: dict[str, Any] | None = None
 
         self.silence: float = 0.0
         self.latest_text: str = ""
@@ -172,9 +175,16 @@ class SharedState:
         self.global_emotes = names or []
         self._merge_meta({"global_emotes": self.global_emotes})
 
-    def mark_real_chat(self) -> None:
+    def mark_real_chat(self, login: str = "", display_name: str = "") -> None:
         self.last_real_chat_at = time.time()
-        self._merge_meta({"last_real_chat_at": self.last_real_chat_at})
+        self.last_real_chat_login = _norm_msg(login).replace(" ", "_")[:25]
+        self.last_real_chat_display = (display_name or login or "").strip()[:25]
+        updates: dict[str, Any] = {"last_real_chat_at": self.last_real_chat_at}
+        if self.last_real_chat_login:
+            updates["last_real_chat_login"] = self.last_real_chat_login
+        if self.last_real_chat_display:
+            updates["last_real_chat_display"] = self.last_real_chat_display
+        self._merge_meta(updates)
 
     def set_quiet(self, seconds: float = 300.0) -> None:
         self.quiet_until = time.time() + max(1.0, float(seconds))
@@ -201,6 +211,55 @@ class SharedState:
 
     def is_quiet(self) -> bool:
         return self.stopped or time.time() < self.quiet_until
+
+    def set_next_speaker_hint(
+        self,
+        bot_name: str,
+        mode: str,
+        *,
+        reason: str = "",
+        source_id: str = "",
+        ttl_s: float = 12.0,
+    ) -> dict[str, Any]:
+        now = time.time()
+        hint = {
+            "id": _h12(f"{bot_name}:{mode}:{source_id}:{now}"),
+            "bot": (bot_name or "").strip().lower(),
+            "mode": (mode or "").strip(),
+            "reason": (reason or "").strip()[:40],
+            "source_id": (source_id or "").strip()[:80],
+            "ts": now,
+            "expires_at": now + max(1.0, float(ttl_s)),
+        }
+        self.next_speaker_hint = hint
+        self._merge_meta({"next_speaker": hint})
+        return hint
+
+    def clear_next_speaker_hint(self, hint_id: str | None = None) -> None:
+        if hint_id and self.next_speaker_hint and self.next_speaker_hint.get("id") != hint_id:
+            return
+        self.next_speaker_hint = None
+        self._merge_meta({"next_speaker": None})
+
+    def active_next_speaker_hint(self, now: float | None = None) -> dict[str, Any] | None:
+        hint = self.next_speaker_hint
+        if not isinstance(hint, dict):
+            return None
+        try:
+            expires_at = float(hint.get("expires_at", 0))
+        except (TypeError, ValueError):
+            return None
+        if (time.time() if now is None else now) >= expires_at:
+            return None
+        if not str(hint.get("bot") or "").strip() or not str(hint.get("mode") or "").strip():
+            return None
+        return hint
+
+    def next_speaker_for(self, bot_name: str, now: float | None = None) -> dict[str, Any] | None:
+        hint = self.active_next_speaker_hint(now)
+        if hint and str(hint.get("bot") or "").lower() == (bot_name or "").lower():
+            return hint
+        return None
 
     def on_text(self, text: str, final: bool = True) -> None:
         if not final:
@@ -290,6 +349,10 @@ class SharedState:
                 self.last_real_chat_at = float(data["last_real_chat_at"])
             except (TypeError, ValueError):
                 pass
+        if isinstance(data.get("last_real_chat_login"), str):
+            self.last_real_chat_login = data["last_real_chat_login"].strip().lower()
+        if isinstance(data.get("last_real_chat_display"), str):
+            self.last_real_chat_display = data["last_real_chat_display"].strip()
         if "quiet_until" in data:
             try:
                 self.quiet_until = float(data["quiet_until"])
@@ -299,6 +362,8 @@ class SharedState:
             self.stopped = data["stopped"]
         if isinstance(data.get("manual_topic"), str):
             self.manual_topic = data["manual_topic"].strip()
+        next_speaker = data.get("next_speaker")
+        self.next_speaker_hint = next_speaker if isinstance(next_speaker, dict) else None
 
     def _read_recent_payload_unlocked(self) -> dict[str, Any]:
         data = _read_json(self.recent_messages_path, {"messages": []})

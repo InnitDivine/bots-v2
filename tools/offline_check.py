@@ -11,6 +11,8 @@ from config import BOTS, is_valid_twitch_token, normalize_twitch_token, validate
 from divbot_commands import apply_divbots_command, parse_divbots_command
 from divbot_memory import DivBotMemory
 from divbot_policy import BotPolicyState, PolicyConfig, decide_send, mark_send, sanitize_message
+from divbot_viewers import DivBotViewers
+from orchestrator import choose_mode
 from shared import SharedState, _read_json
 
 
@@ -48,6 +50,37 @@ def check_shared_json() -> None:
         shared.set_game("Example Game")
         assert shared.try_remember_global_message("example", "hello chat")
         assert not shared.try_remember_global_message("example", "hello chat")
+        hint = shared.set_next_speaker_hint("example", "chat_reply", reason="test", source_id="chat:test")
+        assert shared.next_speaker_for("example")["id"] == hint["id"]
+        shared.clear_next_speaker_hint(hint["id"])
+        assert shared.active_next_speaker_hint() is None
+
+
+def check_orchestrator_logic() -> None:
+    now = 1000.0
+    mode = choose_mode(
+        {"last_real_chat_at": 995.0, "last_real_chat_login": "viewer_a"},
+        {},
+        now,
+        idle_s=50.0,
+    )
+    assert mode and mode[0] == "chat_reply"
+    mode = choose_mode(
+        {"detected_emotion": "hype"},
+        {"id": "line1", "text": "lets go", "ts": 999.0},
+        now,
+        idle_s=50.0,
+    )
+    assert mode and mode[0] == "hype_reaction"
+
+
+def check_viewer_memory() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        viewers = DivBotViewers(Path(td) / "viewers.json")
+        assert viewers.observe_message("viewer_a", "Viewer_A")
+        assert viewers.observe_message("viewer_a", "Viewer_A")
+        assert viewers.helper_viewer_callout("viewer_a", now=100.0) == "yo Viewer_A"
+        assert viewers.helper_viewer_callout("viewer_a", now=120.0) is None
 
 
 def check_corrupt_json_recovery() -> None:
@@ -136,7 +169,7 @@ def check_command_parsing() -> None:
 
 def check_launch_status_import() -> None:
     # Smoke-import the launch and status modules to catch import-time wiring errors.
-    for module in ("launch_multi", "status"):
+    for module in ("launch_multi", "orchestrator", "status"):
         importlib.import_module(module)
 
 
@@ -145,6 +178,8 @@ def main() -> None:
         ("config parsing", check_config),
         ("token validation", check_tokens),
         ("shared JSON", check_shared_json),
+        ("orchestrator logic", check_orchestrator_logic),
+        ("viewer memory", check_viewer_memory),
         ("corrupt JSON recovery", check_corrupt_json_recovery),
         ("TTL prune", check_ttl_prune),
         ("policy throttle", check_policy),
