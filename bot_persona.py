@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import os
 import random
 import re
@@ -84,10 +83,6 @@ def _persona_style(name: str) -> dict:
 def _alias_text() -> str:
     aliases = list(dict.fromkeys([PREFERRED_NAME, *STREAMER_ALIASES, TARGET_CHANNEL]))
     return "/".join(alias for alias in aliases if alias)
-
-
-def _sha12(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
 
 
 def _swap_streamer_alias(rng: random.Random, msg: Optional[str]) -> Optional[str]:
@@ -184,37 +179,46 @@ class Bot(commands.Bot):
         if self._chat_task is None or self._chat_task.done():
             self._chat_task = asyncio.create_task(self.chat_loop(), name=f"{self.p.name}_chat_loop")
 
+    def _message_parts(self, message) -> tuple[str, str, str]:
+        author = ""
+        if message.author is not None and getattr(message.author, "name", None):
+            author = str(message.author.name).strip()
+        display_name = str(getattr(message.author, "display_name", None) or author).strip()
+        text = (message.content or "").strip()
+        return author, display_name, text
+
+    async def _handle_divbots_command(self, message, author: str, text: str) -> bool:
+        if not text.lower().startswith("!divbots"):
+            return False
+        if BOTS and self.p.name != BOTS[0]["name"]:
+            return True
+        if self._command_authorized(message, author):
+            result = apply_divbots_command(text, self.shared, self.memory)
+            if result.handled and result.response:
+                ch = getattr(message, "channel", None)
+                if ch is not None:
+                    await ch.send(result.response)
+        return True
+
+    def _observe_real_chat(self, message, author: str, display_name: str, text: str) -> None:
+        is_mod, is_broadcaster = self._author_roles(message, author)
+        self.shared.mark_real_chat(author, display_name)
+        self.viewers.observe_message(author, display_name, is_mod=is_mod, is_broadcaster=is_broadcaster)
+        self._recent_chat.append((author, text, time.time()))
+
     async def event_message(self, message):
         # Read real channel chat context (cross-chat awareness).
         try:
             if message.echo:
                 return
-            author = ""
-            if message.author is not None and getattr(message.author, "name", None):
-                author = str(message.author.name).strip()
-            display_name = str(getattr(message.author, "display_name", None) or author).strip()
-            text = (message.content or "").strip()
+            author, display_name, text = self._message_parts(message)
             if not author or not text:
                 return
-
-            if text.lower().startswith("!divbots"):
-                if BOTS and self.p.name != BOTS[0]["name"]:
-                    return
-                if self._command_authorized(message, author):
-                    result = apply_divbots_command(text, self.shared, self.memory)
-                    if result.handled and result.response:
-                        ch = getattr(message, "channel", None)
-                        if ch is not None:
-                            await ch.send(result.response)
+            if await self._handle_divbots_command(message, author, text):
                 return
-
-            # Ignore our bot trio for context; keep real chatter and broadcaster lines.
             if author.lower() in self._bot_usernames and not DIVBOTS_ALLOW_BOT_TO_BOT:
                 return
-            is_mod, is_broadcaster = self._author_roles(message, author)
-            self.shared.mark_real_chat(author, display_name)
-            self.viewers.observe_message(author, display_name, is_mod=is_mod, is_broadcaster=is_broadcaster)
-            self._recent_chat.append((author, text, time.time()))
+            self._observe_real_chat(message, author, display_name, text)
         except Exception:
             return
 
@@ -602,6 +606,176 @@ class Bot(commands.Bot):
                 return alt
         return None
 
+    async def _wait_for_chat_tick(self, wait: int) -> bool:
+        new_mic_pending = False
+        remaining = float(wait)
+        while remaining > 0:
+            step = 1.0 if remaining > 1.0 else remaining
+            await asyncio.sleep(step)
+            self.shared.tick(step)
+            self.shared.refresh_transcript()
+            self.shared.refresh_meta()
+            remaining -= step
+            hint = self.shared.next_speaker_for(self.p.name)
+            if hint and str(hint.get("id") or "") != self._last_seen_orchestrator_hint and self._can_send_now():
+                break
+            if self.shared.latest_id and self.shared.latest_id != self._last_seen_mic_id and self._can_send_now():
+                new_mic_pending = True
+                break
+        return new_mic_pending
+
+    def _base_chat_context(self) -> tuple[str, str, bool, bool]:
+        urgent = self.shared.help_mode or (self.shared.hype > 7)
+        help_mode = self.shared.help_mode or (self.shared.silence > 16)
+        if self.shared.detected_emotion == "hype":
+            ctx = "hype"
+            mode = "hype_reaction"
+        elif self.shared.detected_emotion == "fail":
+            ctx = "fail"
+            mode = "fail_reaction"
+        elif help_mode:
+            ctx = "general"
+            mode = "streamer_followup"
+        elif self.rng.random() < 0.1:
+            ctx = "question"
+            mode = "game_question"
+        else:
+            ctx = "general"
+            mode = "idle_question"
+        return ctx, mode, help_mode, urgent
+
+    def _lurk_should_skip(self, urgent: bool) -> bool:
+        if not self._lurk_active():
+            return False
+        if urgent:
+            self._lurk_until = 0.0
+            return False
+        return True
+
+    def _hint_context(self, ctx: str, mode: str, help_mode: bool) -> tuple[bool, Optional[dict], str, str, str, bool]:
+        active_hint = self.shared.active_next_speaker_hint()
+        hint_for_me = self.shared.next_speaker_for(self.p.name)
+        hint_id = str(hint_for_me.get("id") or "") if hint_for_me else ""
+        if active_hint and not hint_for_me:
+            return True, None, "", ctx, mode, help_mode
+        if not hint_for_me or hint_id == self._last_seen_orchestrator_hint:
+            return bool(hint_for_me), hint_for_me, hint_id, ctx, mode, help_mode
+        hinted_mode = str(hint_for_me.get("mode") or "").strip()
+        if hinted_mode:
+            mode = hinted_mode
+            ctx = self._ctx_for_mode(mode, ctx)
+            help_mode = mode in {"streamer_followup", "game_question", "chat_reply"}
+        return False, hint_for_me, hint_id, ctx, mode, help_mode
+
+    def _transcript_send_ready(self, mode: str, new_mic_pending: bool, hinted: bool) -> bool:
+        transcript_ready = self.shared.latest_text and self.shared.latest_id
+        new_line = self.shared.latest_id != self._last_seen_mic_id
+        transcript_mode = mode in {"hype_reaction", "fail_reaction", "streamer_followup", "game_question"}
+        if not (transcript_ready and transcript_mode and self._can_send_now() and self._policy_ok(mode)):
+            return False
+        return bool(new_mic_pending or new_line or hinted)
+
+    async def _generate_transcript_message(self, mode: str, ctx: str, help_mode: bool) -> Optional[str]:
+        generated = self._direct_callout() if _is_callout_request(self.shared.latest_text) else None
+        if generated is None:
+            generated = await self._ai(self.shared.latest_text, help_mode=help_mode, mode=mode)
+        if not generated and (help_mode or ctx == "question"):
+            generated = self._game_question()
+        return generated or (self._emote_only() if self.rng.random() < 0.3 else self._stock(ctx))
+
+    async def _transcript_message(self, mode: str, ctx: str, help_mode: bool, new_mic_pending: bool, hinted: bool) -> Optional[str]:
+        if not self._transcript_send_ready(mode, new_mic_pending, hinted):
+            return None
+        new_line = self.shared.latest_id != self._last_seen_mic_id
+        if new_line:
+            self._last_seen_mic_id = self.shared.latest_id
+        self._recent_mic_lines.append(self.shared.latest_text)
+        return await self._generate_transcript_message(mode, ctx, help_mode)
+
+    async def _hint_message(self, mode: str) -> Optional[str]:
+        if not (self._can_send_now() and self._policy_ok(mode)):
+            return None
+        if mode == "chat_reply":
+            return self._viewer_callout() or await self._ai_background(mode=mode)
+        if mode == "emote_only":
+            return self._emote_only()
+        if mode == "game_question":
+            return self._game_question()
+        if mode == "idle_question":
+            return await self._ai_background(mode=mode) or self._stock("question")
+        return None
+
+    async def _fallback_message(self, mode: str, ctx: str) -> tuple[Optional[str], str]:
+        if not self._can_send_now():
+            return None, mode
+        if self.shared.silence >= BACKGROUND_MIN_SILENCE:
+            mode = "idle_question"
+            if self._policy_ok(mode) and self.rng.random() < BACKGROUND_LLM_PROB:
+                return await self._ai_background(mode=mode), mode
+        if self.shared.hype > 7:
+            mode = "emote_only"
+            if self._policy_ok(mode):
+                self.shared.hype = 5
+                return self._emote_only(), mode
+        if self.rng.random() < 0.08:
+            mode = "emote_only" if self.rng.random() < 0.3 else "chat_reply"
+            if self._policy_ok(mode):
+                return self._stock(ctx), mode
+        return None, mode
+
+    async def _compose_message(
+        self,
+        mode: str,
+        ctx: str,
+        help_mode: bool,
+        new_mic_pending: bool,
+        hint_for_me: Optional[dict],
+    ) -> tuple[Optional[str], str]:
+        message = await self._transcript_message(mode, ctx, help_mode, new_mic_pending, bool(hint_for_me))
+        if hint_for_me and not message:
+            message = await self._hint_message(mode)
+        if not message:
+            message, mode = await self._fallback_message(mode, ctx)
+        return message, mode
+
+    async def _finalize_message(self, message: Optional[str], mode: str, ctx: str, help_mode: bool) -> Optional[str]:
+        message = self._sanitize(message)
+        message = self._diversify(message, ctx=ctx, help_mode=help_mode)
+        if message and not self._policy_ok(mode, message):
+            return None
+        if message and not await self._judge_ok(mode, message):
+            return None
+        return message
+
+    def _mark_hint_seen(self, hint_id: str) -> None:
+        if hint_id:
+            self._last_seen_orchestrator_hint = hint_id
+            self.shared.clear_next_speaker_hint(hint_id)
+
+    async def _send_message(self, message: Optional[str], mode: str, ctx: str, help_mode: bool, hint_id: str) -> None:
+        if not message:
+            self._mark_hint_seen(hint_id)
+            return
+        ch = self.connected_channels[0] if self.connected_channels else self.get_channel(TARGET_CHANNEL)
+        reserved = False
+        if ch is not None:
+            reserved = self.shared.try_remember_global_message(
+                self.p.name,
+                message,
+                max_per_minute=GLOBAL_MAX_MSG_PER_MINUTE,
+                min_interval_s=GLOBAL_MIN_COOLDOWN_SECS,
+                max_per_window=DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN,
+                window_s=300.0,
+            )
+        if ch is not None and reserved:
+            await ch.send(message)
+            self._last_send_mode = mode
+            self._mark_sent()
+            self._record_local_line(message)
+            tag = "HELP" if help_mode else "NORMAL"
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.p.name} -> '{message}' [{tag}/{ctx.upper()}]")
+        self._mark_hint_seen(hint_id)
+
     async def chat_loop(self):
         await asyncio.sleep(self.rng.uniform(3, 8))
         print(f"{self.p.name} chat loop started")
@@ -609,152 +783,18 @@ class Bot(commands.Bot):
         while True:
             try:
                 minw, maxw = self.p.message_frequency
-                wait = self.rng.randint(minw, maxw)
-                new_mic_pending = False
-                remaining = float(wait)
-                while remaining > 0:
-                    step = 1.0 if remaining > 1.0 else remaining
-                    await asyncio.sleep(step)
-                    self.shared.tick(step)
-                    self.shared.refresh_transcript()
-                    self.shared.refresh_meta()
-                    remaining -= step
-                    hint = self.shared.next_speaker_for(self.p.name)
-                    if (
-                        hint
-                        and str(hint.get("id") or "") != self._last_seen_orchestrator_hint
-                        and self._can_send_now()
-                    ):
-                        break
-                    if (
-                        self.shared.latest_id
-                        and self.shared.latest_id != self._last_seen_mic_id
-                        and self._can_send_now()
-                    ):
-                        new_mic_pending = True
-                        break
-
-                urgent = self.shared.help_mode or (self.shared.hype > 7)
-                if self._lurk_active() and not urgent:
+                new_mic_pending = await self._wait_for_chat_tick(self.rng.randint(minw, maxw))
+                ctx, mode, help_mode, urgent = self._base_chat_context()
+                if self._lurk_should_skip(urgent):
                     continue
-                if self._lurk_active() and urgent:
-                    self._lurk_until = 0.0
 
-                help_mode = self.shared.help_mode or (self.shared.silence > 16)
-                if self.shared.detected_emotion == "hype":
-                    ctx = "hype"
-                elif self.shared.detected_emotion == "fail":
-                    ctx = "fail"
-                elif self.rng.random() < 0.1:
-                    ctx = "question"
-                else:
-                    ctx = "general"
-                if ctx == "hype":
-                    mode = "hype_reaction"
-                elif ctx == "fail":
-                    mode = "fail_reaction"
-                elif help_mode:
-                    mode = "streamer_followup"
-                elif ctx == "question":
-                    mode = "game_question"
-                else:
-                    mode = "idle_question"
-
-                active_hint = self.shared.active_next_speaker_hint()
-                hint_for_me = self.shared.next_speaker_for(self.p.name)
-                hint_id = str(hint_for_me.get("id") or "") if hint_for_me else ""
-                if active_hint and not hint_for_me:
+                skip, hint_for_me, hint_id, ctx, mode, help_mode = self._hint_context(ctx, mode, help_mode)
+                if skip:
                     continue
-                if hint_for_me:
-                    if hint_id == self._last_seen_orchestrator_hint:
-                        continue
-                    hinted_mode = str(hint_for_me.get("mode") or "").strip()
-                    if hinted_mode:
-                        mode = hinted_mode
-                        ctx = self._ctx_for_mode(mode, ctx)
-                        help_mode = mode in {"streamer_followup", "game_question", "chat_reply"}
 
-                message: Optional[str] = None
-
-                if (
-                    self.shared.latest_text
-                    and self.shared.latest_id
-                    and self._can_send_now()
-                    and self._policy_ok(mode)
-                    and (new_mic_pending or self.shared.latest_id != self._last_seen_mic_id or hint_for_me)
-                    and mode in {"hype_reaction", "fail_reaction", "streamer_followup", "game_question"}
-                ):
-                    if self.shared.latest_id != self._last_seen_mic_id:
-                        self._last_seen_mic_id = self.shared.latest_id
-                    self._recent_mic_lines.append(self.shared.latest_text)
-                    if _is_callout_request(self.shared.latest_text):
-                        m = self._direct_callout()
-                    else:
-                        m = await self._ai(self.shared.latest_text, help_mode=help_mode, mode=mode)
-                    if not m:
-                        m = self._game_question() if (help_mode or ctx == "question") else None
-                    message = m or (self._emote_only() if self.rng.random() < 0.3 else self._stock(ctx))
-
-                if hint_for_me and not message and self._can_send_now() and self._policy_ok(mode):
-                    if mode == "chat_reply":
-                        message = self._viewer_callout() or await self._ai_background(mode=mode)
-                    elif mode == "emote_only":
-                        message = self._emote_only()
-                    elif mode == "game_question":
-                        message = self._game_question()
-                    elif mode == "idle_question":
-                        message = await self._ai_background(mode=mode) or self._stock("question")
-
-                if not message and self._can_send_now() and self.shared.silence >= BACKGROUND_MIN_SILENCE:
-                    mode = "idle_question"
-                    if self._policy_ok(mode) and self.rng.random() < BACKGROUND_LLM_PROB:
-                        message = await self._ai_background(mode=mode)
-
-                if not message and self._can_send_now() and self.shared.hype > 7:
-                    mode = "emote_only"
-                    if self._policy_ok(mode):
-                        message = self._emote_only()
-                        self.shared.hype = 5
-
-                if not message and self._can_send_now() and self.rng.random() < 0.08:
-                    mode = "emote_only" if self.rng.random() < 0.3 else "chat_reply"
-                    if self._policy_ok(mode):
-                        message = self._stock(ctx)
-
-                message = self._sanitize(message)
-                message = self._diversify(message, ctx=ctx, help_mode=help_mode)
-                if message and not self._policy_ok(mode, message):
-                    message = None
-                if message and not await self._judge_ok(mode, message):
-                    message = None
-
-                if message:
-                    ch = self.connected_channels[0] if self.connected_channels else self.get_channel(TARGET_CHANNEL)
-                    reserved = False
-                    if ch is not None:
-                        reserved = self.shared.try_remember_global_message(
-                            self.p.name,
-                            message,
-                            max_per_minute=GLOBAL_MAX_MSG_PER_MINUTE,
-                            min_interval_s=GLOBAL_MIN_COOLDOWN_SECS,
-                            max_per_window=DIVBOTS_MAX_CAST_MESSAGES_PER_5_MIN,
-                            window_s=300.0,
-                        )
-                    if ch is not None and reserved:
-                        await ch.send(message)
-                        self._last_send_mode = mode
-                        self._mark_sent()
-                        self._record_local_line(message)
-                        if hint_id:
-                            self._last_seen_orchestrator_hint = hint_id
-                            self.shared.clear_next_speaker_hint(hint_id)
-                        tag = "HELP" if help_mode else "NORMAL"
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.p.name} -> '{message}' [{tag}/{ctx.upper()}]")
-                    elif hint_id:
-                        self._last_seen_orchestrator_hint = hint_id
-                        self.shared.clear_next_speaker_hint(hint_id)
-                elif hint_id:
-                    self._last_seen_orchestrator_hint = hint_id
+                message, mode = await self._compose_message(mode, ctx, help_mode, new_mic_pending, hint_for_me)
+                message = await self._finalize_message(message, mode, ctx, help_mode)
+                await self._send_message(message, mode, ctx, help_mode, hint_id)
 
                 if not urgent and not self._lurk_active():
                     self._maybe_enter_lurk()

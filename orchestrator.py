@@ -1,6 +1,6 @@
 import argparse
-import hashlib
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -84,55 +84,81 @@ def choose_bot_for_mode(bots: list[dict[str, Any]], mode: str, source_id: str, n
     eligible.sort(key=lambda bot: (*scores.get(bot["name"], (0, 0.0)), bot["name"]))
     best_score = scores.get(eligible[0]["name"], (0, 0.0))
     tied = [bot for bot in eligible if scores.get(bot["name"], (0, 0.0)) == best_score]
-    pick_index = int(hashlib.sha1(source_id.encode("utf-8", "ignore")).hexdigest()[:6], 16) % len(tied)
+    pick_index = zlib.crc32(source_id.encode("utf-8", "ignore")) % len(tied)
     return tied[pick_index]["name"]
 
 
-def choose_mode(meta: dict[str, Any], transcript: dict[str, Any], now: float, idle_s: float) -> tuple[str, str, str] | None:
+def _quiet_active(meta: dict[str, Any], now: float) -> bool:
     if bool(meta.get("stopped")):
-        return None
+        return True
     try:
-        if now < float(meta.get("quiet_until", 0)):
-            return None
+        return now < float(meta.get("quiet_until", 0))
     except (TypeError, ValueError):
-        pass
+        return False
 
+
+def _float_meta(payload: dict[str, Any], key: str) -> float:
     try:
-        chat_at = float(meta.get("last_real_chat_at", 0))
+        return float(payload.get(key, 0))
     except (TypeError, ValueError):
-        chat_at = 0.0
+        return 0.0
+
+
+def _chat_mode(meta: dict[str, Any], now: float) -> tuple[str, str, str] | None:
+    chat_at = _float_meta(meta, "last_real_chat_at")
     chat_login = str(meta.get("last_real_chat_login") or "").strip().lower()
     if chat_login and now - chat_at <= 12.0:
         return "chat_reply", f"chat:{chat_login}:{int(chat_at)}", "real_chat"
+    return None
 
+
+def _transcript_mode(meta: dict[str, Any], transcript: dict[str, Any], now: float) -> tuple[str, str, str] | None:
     source_id = str(transcript.get("id") or "").strip()
     transcript_text = str(transcript.get("text") or "").strip()
-    try:
-        transcript_at = float(transcript.get("ts", 0))
-    except (TypeError, ValueError):
-        transcript_at = 0.0
-    if source_id and transcript_text and now - transcript_at <= 90.0:
-        emotion = str(meta.get("detected_emotion") or "").lower()
-        if emotion == "hype":
-            return "hype_reaction", source_id, "transcript_hype"
-        if emotion == "fail":
-            return "fail_reaction", source_id, "transcript_fail"
-        if bool(meta.get("help_mode")):
-            return "streamer_followup", source_id, "transcript_help"
-        if "?" in transcript_text:
-            return "game_question", source_id, "transcript_question"
-        return "streamer_followup", source_id, "transcript"
+    transcript_at = _float_meta(transcript, "ts")
+    if not (source_id and transcript_text and now - transcript_at <= 90.0):
+        return None
+    emotion = str(meta.get("detected_emotion") or "").lower()
+    if emotion == "hype":
+        return "hype_reaction", source_id, "transcript_hype"
+    if emotion == "fail":
+        return "fail_reaction", source_id, "transcript_fail"
+    if bool(meta.get("help_mode")):
+        return "streamer_followup", source_id, "transcript_help"
+    if "?" in transcript_text:
+        return "game_question", source_id, "transcript_question"
+    return "streamer_followup", source_id, "transcript"
 
+
+def _hype_mode(meta: dict[str, Any], now: float) -> tuple[str, str, str] | None:
     try:
         hype = int(meta.get("hype", 0))
     except (TypeError, ValueError):
         hype = 0
     if hype > 7:
         return "emote_only", f"hype:{int(now // 10)}", "hype"
+    return None
 
-    last_activity = max(chat_at, transcript_at)
+
+def _idle_mode(meta: dict[str, Any], transcript: dict[str, Any], now: float, idle_s: float) -> tuple[str, str, str] | None:
+    last_activity = max(_float_meta(meta, "last_real_chat_at"), _float_meta(transcript, "ts"))
     if last_activity > 0 and now - last_activity >= idle_s:
         return "idle_question", f"idle:{int(now // max(1.0, idle_s))}", "idle"
+    return None
+
+
+def choose_mode(meta: dict[str, Any], transcript: dict[str, Any], now: float, idle_s: float) -> tuple[str, str, str] | None:
+    if _quiet_active(meta, now):
+        return None
+    for chooser in (
+        lambda: _chat_mode(meta, now),
+        lambda: _transcript_mode(meta, transcript, now),
+        lambda: _hype_mode(meta, now),
+        lambda: _idle_mode(meta, transcript, now, idle_s),
+    ):
+        choice = chooser()
+        if choice:
+            return choice
     return None
 
 

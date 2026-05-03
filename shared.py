@@ -1,10 +1,10 @@
 import contextlib
-import hashlib
 import json
 import os
 import re
 import threading
 import time
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -30,7 +30,8 @@ HELP_TERMS = {"help", "how", "what", "why", "where", "when", "which", "plan", "b
 
 
 def _h12(text: str) -> str:
-    return hashlib.sha1((text or "").encode("utf-8", "ignore")).hexdigest()[:12]
+    raw = (text or "").encode("utf-8", "ignore")
+    return f"{zlib.crc32(raw):08x}{len(raw) & 0xFFFF:04x}"
 
 
 def _norm_msg(msg: str) -> str:
@@ -322,19 +323,15 @@ class SharedState:
             existing.update(payload)
             _atomic_write_json(self.meta_path, existing)
 
-    def refresh_meta(self) -> None:
-        if self.meta_path is None:
-            return
-        with _file_lock(self.meta_path):
-            data = _read_json(self.meta_path, {})
-        if not isinstance(data, dict):
-            return
+    def _apply_meta_game(self, data: dict[str, Any]) -> None:
         game = (data.get("game") or "").strip()
         emotes = data.get("global_emotes")
         if game:
             self.game = game
         if isinstance(emotes, list):
             self.global_emotes = [str(x) for x in emotes if str(x).strip()]
+
+    def _apply_meta_signal(self, data: dict[str, Any]) -> None:
         if "hype" in data:
             try:
                 self.hype = max(0, min(10, int(data["hype"])))
@@ -344,6 +341,8 @@ class SharedState:
             self.detected_emotion = data["detected_emotion"].strip() or "neutral"
         if isinstance(data.get("help_mode"), bool):
             self.help_mode = data["help_mode"]
+
+    def _apply_meta_chat(self, data: dict[str, Any]) -> None:
         if "last_real_chat_at" in data:
             try:
                 self.last_real_chat_at = float(data["last_real_chat_at"])
@@ -353,6 +352,8 @@ class SharedState:
             self.last_real_chat_login = data["last_real_chat_login"].strip().lower()
         if isinstance(data.get("last_real_chat_display"), str):
             self.last_real_chat_display = data["last_real_chat_display"].strip()
+
+    def _apply_meta_control(self, data: dict[str, Any]) -> None:
         if "quiet_until" in data:
             try:
                 self.quiet_until = float(data["quiet_until"])
@@ -364,6 +365,18 @@ class SharedState:
             self.manual_topic = data["manual_topic"].strip()
         next_speaker = data.get("next_speaker")
         self.next_speaker_hint = next_speaker if isinstance(next_speaker, dict) else None
+
+    def refresh_meta(self) -> None:
+        if self.meta_path is None:
+            return
+        with _file_lock(self.meta_path):
+            data = _read_json(self.meta_path, {})
+        if not isinstance(data, dict):
+            return
+        self._apply_meta_game(data)
+        self._apply_meta_signal(data)
+        self._apply_meta_chat(data)
+        self._apply_meta_control(data)
 
     def _read_recent_payload_unlocked(self) -> dict[str, Any]:
         data = _read_json(self.recent_messages_path, {"messages": []})
@@ -394,6 +407,27 @@ class SharedState:
             self._write_recent_payload_unlocked(data)
         return dup
 
+    def _recent_limit_blocked(
+        self,
+        kept: list[dict[str, Any]],
+        now: float,
+        max_per_minute: int | None,
+        min_interval_s: float,
+        max_per_window: int | None,
+        window_s: float,
+    ) -> bool:
+        if max_per_minute is not None and max_per_minute >= 0:
+            if sum(1 for row in kept if now - float(row.get("ts", 0)) <= 60.0) >= max_per_minute:
+                return True
+        if min_interval_s > 0 and kept:
+            latest = max(float(row.get("ts", 0)) for row in kept)
+            if now - latest < min_interval_s:
+                return True
+        if max_per_window is None or max_per_window < 0:
+            return False
+        window_count = sum(1 for row in kept if now - float(row.get("ts", 0)) <= window_s)
+        return window_count >= max_per_window
+
     def try_remember_global_message(
         self,
         bot_name: str,
@@ -415,24 +449,10 @@ class SharedState:
                 data["messages"] = kept
                 self._write_recent_payload_unlocked(data)
                 return False
-            if max_per_minute is not None and max_per_minute >= 0:
-                minute_count = sum(1 for row in kept if now - float(row.get("ts", 0)) <= 60.0)
-                if minute_count >= max_per_minute:
-                    data["messages"] = kept
-                    self._write_recent_payload_unlocked(data)
-                    return False
-            if min_interval_s > 0 and kept:
-                latest = max(float(row.get("ts", 0)) for row in kept)
-                if now - latest < min_interval_s:
-                    data["messages"] = kept
-                    self._write_recent_payload_unlocked(data)
-                    return False
-            if max_per_window is not None and max_per_window >= 0:
-                window_count = sum(1 for row in kept if now - float(row.get("ts", 0)) <= window_s)
-                if window_count >= max_per_window:
-                    data["messages"] = kept
-                    self._write_recent_payload_unlocked(data)
-                    return False
+            if self._recent_limit_blocked(kept, now, max_per_minute, min_interval_s, max_per_window, window_s):
+                data["messages"] = kept
+                self._write_recent_payload_unlocked(data)
+                return False
             kept.append({"bot": bot_name, "norm": norm, "raw": message, "ts": now})
             data["messages"] = kept[-120:]
             self._write_recent_payload_unlocked(data)
